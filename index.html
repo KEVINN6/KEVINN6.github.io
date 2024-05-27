@@ -1,50 +1,124 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zxx">
+
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>信息公布网站</title>
-    <link rel="stylesheet" href="css/styles1.css">
+	<title></title>
+	<!-- Meta tag Keywords -->
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta charset="UTF-8" />
+	<meta name="keywords"
+		content="" />
+	<!-- //Meta tag Keywords -->
+
+	<link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;700&display=swap" rel="stylesheet">
+	<!-- //google fonts -->
+
+	<link rel="stylesheet" href="css/style.css" type="text/css" media="all" /> <!-- //Style-CSS -->
+
+	<link href="css/font-awesome.css" rel="stylesheet"><!-- //font-awesome-icons -->
+
 </head>
+
 <body>
-<header>
-    <h1>信息公布网站</h1>
-    <nav>
-        <ul>
-            <li><a href="#home">首页</a></li>
-            <li><a href="#announcements">公告</a></li>
-            <li><a href="#contact">联系我们</a></li>
-        </ul>
-    </nav>
-</header>
-<main>
-    <section id="announcements">
-        <h2>最新公告</h2>
-        <table>
-            <thead>
-            <tr>
-                <th>日期</th>
-                <th>标题</th>
-                <th>内容</th>
-            </tr>
-            </thead>
-            <tbody>
-            <tr>
-                <td>2024-05-27</td>
-                <td>新功能发布</td>
-                <td>崔瑞祥是sbbbbb。</td>
-            </tr>
-            <tr>
-                <td>2024-04-15</td>
-                <td>系统维护</td>
-                <td>网站将于本周末进行系统维护，期间可能无法访问。</td>
-            </tr>
-            </tbody>
-        </table>
-    </section>
-</main>
-<footer>
-    <p>&copy; 2024 信息公布网站. 版权所有.</p>
-</footer>
+	<!-- coming soon -->
+	<section class="w3l-coming-soon-page">
+		<div class="coming-page-info">
+			<div class="wrapper">
+				<div class="logo-center">
+					<a class="logo" href="index.html">
+						<span class="fa fa-glass"></span> 哦？
+					</a>
+				</div>
+				<!-- if logo is image enable this   
+                    <a class="logo" href="#index.html">
+                        <img src="image-path" alt="Your logo" title="Your logo" style="height:35px;" />
+					</a> -->
+
+				<div class="coming-block">
+					<h1>Coming Soon</h1>
+					<h4 class="">AAAAA</h4>
+					<p>👌</p>
+
+					<!-- countdown -->
+					<div class="countdown">
+						<div class="countdown__days">
+							<div class="number"></div>
+							<span class>天</span>
+						</div>
+
+						<div class="countdown__hours">
+							<div class="number"></div>
+							<span class>时</span>
+						</div>
+
+						<div class="countdown__minutes">
+							<div class="number"></div>
+							<span class>分</span>
+						</div>
+
+						<div class="countdown__seconds">
+							<div class="number"></div>
+							<span class>秒</span>
+						</div>
+					</div>
+					<!-- countdown -->
+
+					<div class="contact-button">
+						<a href="index1.html" class="btn">Contact Us</a>
+					</div>
+				</div>
+				<!-- copyright -->
+				<div class="copyright-footer">
+					<div class="w3l-copy-right">
+						<p>Copyright &copy; 2024.Company name All rights reserved.</a></p>
+					</div>
+				</div>
+				<!-- //copyright -->
+			</div>
+		</div>
+
+		<!-- js -->
+		<script src="js/jquery-3.3.1.min.js"></script>
+
+		<!-- Script for counter -->
+		<script>
+			(() => {
+				// Specify the deadline date
+				const deadlineDate = new Date('September 10, 2024 23:59:59').getTime();
+
+				// Cache all countdown boxes into consts
+				const countdownDays = document.querySelector('.countdown__days .number');
+				const countdownHours = document.querySelector('.countdown__hours .number');
+				const countdownMinutes = document.querySelector('.countdown__minutes .number');
+				const countdownSeconds = document.querySelector('.countdown__seconds .number');
+
+				// Update the count down every 1 second (1000 milliseconds)
+				setInterval(() => {
+					// Get current date and time
+					const currentDate = new Date().getTime();
+
+					// Calculate the distance between current date and time and the deadline date and time
+					const distance = deadlineDate - currentDate;
+
+					// Calculations the data for remaining days, hours, minutes and seconds
+					const days = Math.floor(distance / (1000 * 60 * 60 * 24));
+					const hours = Math.floor((distance % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+					const minutes = Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60));
+					const seconds = Math.floor((distance % (1000 * 60)) / 1000);
+
+					// Insert the result data into individual countdown boxes
+					countdownDays.innerHTML = days;
+					countdownHours.innerHTML = hours;
+					countdownMinutes.innerHTML = minutes;
+					countdownSeconds.innerHTML = seconds;
+				}, 1000);
+			})();
+		</script>
+		<!-- //Script for counter -->
+
+	</section>
+	<!-- //coming soon -->
+
 </body>
+
 </html>
