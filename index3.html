@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>music</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
+        
+        body {
+            font-family: 'Roboto', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
+            color: #333;
+        }
+        .container {
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 30px;
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            width: 350px;
+            transition: all 0.3s ease;
+        }
+        .container:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 35px rgba(0,0,0,0.3);
+        }
+        .login-form, .player {
+            display: none;
+        }
+        h2 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 20px;
+        }
+        input, button, select {
+            display: block;
+            width: 100%;
+            margin: 15px 0;
+            padding: 10px;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        input, select {
+            background-color: #f0f0f0;
+            transition: all 0.3s ease;
+        }
+        input:focus, select:focus {
+            outline: none;
+            box-shadow: 0 0 0 2px #4ECDC4;
+        }
+        button {
+            background-color: #FF6B6B;
+            color: white;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        button:hover {
+            background-color: #ff4f4f;
+        }
+        .controls {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 20px;
+        }
+        .controls button {
+            width: 30%;
+            padding: 10px 0;
+            font-size: 14px;
+        }
+        #progressBar, #volumeBar {
+            width: 100%;
+            margin-top: 20px;
+            -webkit-appearance: none;
+            background: #f0f0f0;
+            outline: none;
+            border-radius: 10px;
+            height: 6px;
+        }
+        #progressBar::-webkit-slider-thumb, #volumeBar::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 15px;
+            height: 15px;
+            background: #FF6B6B;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+        #currentTime {
+            text-align: center;
+            margin-top: 10px;
+            font-size: 14px;
+        }
+        #albumArt {
+            width: 200px;
+            height: 200px;
+            margin: 20px auto;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 24px;
+            font-weight: bold;
+            color: white;
+            text-align: center;
+        }
+        .volume-control {
+            display: flex;
+            align-items: center;
+            margin-top: 10px;
+        }
+        .volume-control input {
+            flex-grow: 1;
+            margin-right: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="loginForm" class="login-form">
+            <h2>登录</h2>
+            <input type="text" id="username" placeholder="用户名">
+            <input type="password" id="password" placeholder="密码">
+            <button onclick="login()">登录</button>
+        </div>
+        <div id="player" class="player">
+            <h2>音乐播放器</h2>
+            <div id="albumArt"></div>
+            <select id="songSelect" onchange="changeSong()">
+                <option value="./music/song1.mp3">不遗憾</option>
+                <option value="./music/song2.flac">交换余生</option>
+                <option value="./music/song3.mp3">违背的青春</option>
+            </select>
+            <audio id="audio"></audio>
+            <input type="range" id="progressBar" value="0" step="1">
+            <div id="currentTime">0:00 / 0:00</div>
+            <div class="volume-control">
+                <input type="range" id="volumeBar" min="0" max="1" step="0.05" value="1">
+                <span id="volumeDisplay">100%</span>
+            </div>
+            <div class="controls">
+                <button onclick="previousSong()">上一首</button>
+                <button onclick="togglePlay()" id="playPauseBtn">播放</button>
+                <button onclick="nextSong()">下一首</button>
+            </div>
+            <button onclick="logout()">退出登录</button>
+        </div>
+    </div>
+
+    <script>
+        const audio = document.getElementById('audio');
+        const progressBar = document.getElementById('progressBar');
+        const currentTime = document.getElementById('currentTime');
+        const songSelect = document.getElementById('songSelect');
+        const playPauseBtn = document.getElementById('playPauseBtn');
+        const volumeBar = document.getElementById('volumeBar');
+        const volumeDisplay = document.getElementById('volumeDisplay');
+        const albumArt = document.getElementById('albumArt');
+
+        function login() {
+            var username = document.getElementById('username').value;
+            var password = document.getElementById('password').value;
+            if (username === "admin" && password === "1111") {
+                document.getElementById('loginForm').style.display = 'none';
+                document.getElementById('player').style.display = 'block';
+                changeSong(); // 加载第一首歌
+            } else {
+                alert("用户名或密码错误！");
+            }
+        }
+
+        function logout() {
+            document.getElementById('loginForm').style.display = 'block';
+            document.getElementById('player').style.display = 'none';
+            document.getElementById('username').value = '';
+            document.getElementById('password').value = '';
+            audio.pause();
+        }
+
+        function changeSong() {
+            audio.src = songSelect.value;
+            audio.play();
+            updatePlayPauseButton();
+            updateAlbumArt();
+        }
+
+        function togglePlay() {
+            if (audio.paused) {
+                audio.play();
+            } else {
+                audio.pause();
+            }
+            updatePlayPauseButton();
+        }
+
+        function updatePlayPauseButton() {
+            playPauseBtn.textContent = audio.paused ? '播放' : '暂停';
+        }
+
+        function previousSong() {
+            songSelect.selectedIndex = (songSelect.selectedIndex - 1 + songSelect.options.length) % songSelect.options.length;
+            changeSong();
+        }
+
+        function nextSong() {
+            songSelect.selectedIndex = (songSelect.selectedIndex + 1) % songSelect.options.length;
+            changeSong();
+        }
+
+        function updateAlbumArt() {
+            const randomColor = Math.floor(Math.random()*16777215).toString(16);
+            albumArt.style.backgroundColor = "#" + randomColor;
+            albumArt.textContent = songSelect.options[songSelect.selectedIndex].text;
+        }
+
+        audio.addEventListener('timeupdate', function() {
+            const duration = audio.duration;
+            const currentTimeValue = audio.currentTime;
+            progressBar.max = duration;
+            progressBar.value = currentTimeValue;
+            currentTime.textContent = formatTime(currentTimeValue) + ' / ' + formatTime(duration);
+        });
+
+        progressBar.addEventListener('input', function() {
+            audio.currentTime = progressBar.value;
+        });
+
+        volumeBar.addEventListener('input', function() {
+            audio.volume = volumeBar.value;
+            volumeDisplay.textContent = Math.round(volumeBar.value * 100) + '%';
+        });
+
+        function formatTime(time) {
+            const minutes = Math.floor(time / 60);
+            const seconds = Math.floor(time % 60);
+            return minutes + ':' + (seconds < 10 ? '0' : '') + seconds;
+        }
+         // 新增：监听音频播放结束事件
+        audio.addEventListener('ended', function() {
+            nextSong();
+        });
+
+        // 初始显示登录表单
+        document.getElementById('loginForm').style.display = 'block';
+    </script>
+</body>
+</html>
