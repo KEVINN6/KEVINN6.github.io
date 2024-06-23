@@ -1,254 +1,555 @@
 <!DOCTYPE html>
 <html lang="zh">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>music</title>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
-        
-        body {
-            font-family: 'Roboto', sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-            background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
-            color: #333;
-        }
-        .container {
-            background-color: rgba(255, 255, 255, 0.9);
-            padding: 30px;
-            border-radius: 20px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-            width: 350px;
-            transition: all 0.3s ease;
-        }
-        .container:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 35px rgba(0,0,0,0.3);
-        }
-        .login-form, .player {
-            display: none;
-        }
-        h2 {
-            text-align: center;
-            color: #333;
-            margin-bottom: 20px;
-        }
-        input, button, select {
-            display: block;
-            width: 100%;
-            margin: 15px 0;
-            padding: 10px;
-            border: none;
-            border-radius: 5px;
-            font-size: 16px;
-        }
-        input, select {
-            background-color: #f0f0f0;
-            transition: all 0.3s ease;
-        }
-        input:focus, select:focus {
-            outline: none;
-            box-shadow: 0 0 0 2px #4ECDC4;
-        }
-        button {
-            background-color: #FF6B6B;
-            color: white;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-        button:hover {
-            background-color: #ff4f4f;
-        }
-        .controls {
-            display: flex;
-            justify-content: space-between;
-            margin-top: 20px;
-        }
-        .controls button {
-            width: 30%;
-            padding: 10px 0;
-            font-size: 14px;
-        }
-        #progressBar, #volumeBar {
-            width: 100%;
-            margin-top: 20px;
-            -webkit-appearance: none;
-            background: #f0f0f0;
-            outline: none;
-            border-radius: 10px;
-            height: 6px;
-        }
-        #progressBar::-webkit-slider-thumb, #volumeBar::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 15px;
-            height: 15px;
-            background: #FF6B6B;
-            border-radius: 50%;
-            cursor: pointer;
-        }
-        #currentTime {
-            text-align: center;
-            margin-top: 10px;
-            font-size: 14px;
-        }
-        #albumArt {
-            width: 200px;
-            height: 200px;
-            margin: 20px auto;
-            border-radius: 10px;
-            overflow: hidden;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            font-size: 24px;
-            font-weight: bold;
-            color: white;
-            text-align: center;
-        }
-        .volume-control {
-            display: flex;
-            align-items: center;
-            margin-top: 10px;
-        }
-        .volume-control input {
-            flex-grow: 1;
-            margin-right: 10px;
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>music</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
+
+    body {
+      font-family: 'Roboto', sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+      background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
+      color: #333;
+    }
+    .main-container {
+      display: flex;
+      background-color: rgba(255, 255, 255, 0.9);
+      border-radius: 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+      transition: all 0.3s ease;
+    }
+    .main-container:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 15px 35px rgba(0,0,0,0.3);
+    }
+    .container {
+      padding: 30px;
+      width: 350px;
+    }
+    .login-form, .player {
+      display: none;
+    }
+    h2 {
+      text-align: center;
+      color: #333;
+      margin-bottom: 20px;
+    }
+    input, button, select {
+      display: block;
+      width: 100%;
+      margin: 15px 0;
+      padding: 10px;
+      border: none;
+      border-radius: 5px;
+      font-size: 16px;
+    }
+    input, select {
+      background-color: #f0f0f0;
+      transition: all 0.3s ease;
+    }
+    input:focus, select:focus {
+      outline: none;
+      box-shadow: 0 0 0 2px #4ECDC4;
+    }
+    button {
+      background-color: #FF6B6B;
+      color: white;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    button:hover {
+      background-color: #ff4f4f;
+    }
+    .controls {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 20px;
+    }
+    .controls button {
+      width: 30%;
+      padding: 10px 0;
+      font-size: 14px;
+    }
+    #progressBar, #volumeBar {
+      width: 100%;
+      margin-top: 20px;
+      -webkit-appearance: none;
+      background: #f0f0f0;
+      outline: none;
+      border-radius: 10px;
+      height: 6px;
+    }
+    #progressBar::-webkit-slider-thumb, #volumeBar::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 15px;
+      height: 15px;
+      background: #FF6B6B;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+    #currentTime {
+      text-align: center;
+      margin-top: 10px;
+      font-size: 14px;
+    }
+    #albumArt {
+      width: 200px;
+      height: 200px;
+      margin: 20px auto;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-size: 24px;
+      font-weight: bold;
+      color: white;
+      text-align: center;
+    }
+    .volume-control {
+      display: flex;
+      align-items: center;
+      margin-top: 10px;
+    }
+    .volume-control input {
+      flex-grow: 1;
+      margin-right: 10px;
+    }
+    .lyrics-container {
+      width: 300px;
+      padding: 20px;
+      background-color: rgba(255, 255, 255, 0.8);
+      border-left: 1px solid #ddd;
+      display: none;
+      overflow-y: auto;
+      max-height: 600px;
+    }
+    .lyrics-container h3 {
+      text-align: center;
+      margin-bottom: 15px;
+    }
+    .lyrics-text {
+      white-space: pre-wrap;
+      line-height: 1.6;
+    }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <div id="loginForm" class="login-form">
-            <h2>登录</h2>
-            <input type="text" id="username" placeholder="用户名">
-            <input type="password" id="password" placeholder="密码">
-            <button onclick="login()">登录</button>
-        </div>
-        <div id="player" class="player">
-            <h2>音乐播放器</h2>
-            <div id="albumArt"></div>
-            <select id="songSelect" onchange="changeSong()">
-                <option value="./music/song1.mp3">不遗憾</option>
-                <option value="./music/song2.mp3">剪云者</option>
-                <option value="./music/song3.mp3">违背的青春</option>
-            </select>
-            <audio id="audio"></audio>
-            <input type="range" id="progressBar" value="0" step="1">
-            <div id="currentTime">0:00 / 0:00</div>
-            <div class="volume-control">
-                <input type="range" id="volumeBar" min="0" max="1" step="0.05" value="1">
-                <span id="volumeDisplay">100%</span>
-            </div>
-            <div class="controls">
-                <button onclick="previousSong()">上一首</button>
-                <button onclick="togglePlay()" id="playPauseBtn">播放</button>
-                <button onclick="nextSong()">下一首</button>
-            </div>
-            <button onclick="logout()">退出登录</button>
-        </div>
+<div class="main-container">
+  <div class="container">
+    <div id="loginForm" class="login-form">
+      <h2>登录</h2>
+      <input type="text" id="username" placeholder="用户名">
+      <input type="password" id="password" placeholder="密码">
+      <button onclick="login()">登录</button>
     </div>
+    <div id="player" class="player">
+      <h2>music</h2>
+      <div id="albumArt"></div>
+      <select id="songSelect" onchange="changeSong()">
+        <option value="./music/song1.mp3">不遗憾</option>
+        <option value="./music/song2.mp3">剪云者</option>
+        <option value="./music/song3.mp3">违背的青春</option>
+      </select>
+      <audio id="audio"></audio>
+      <input type="range" id="progressBar" value="0" step="1">
+      <div id="currentTime">0:00 / 0:00</div>
+      <div class="volume-control">
+        <input type="range" id="volumeBar" min="0" max="1" step="0.1" value="1">
+        <span id="volumeDisplay">100%</span>
+      </div>
+      <div class="controls">
+        <button onclick="previousSong()">上一首</button>
+        <button onclick="togglePlay()" id="playPauseBtn">播放</button>
+        <button onclick="nextSong()">下一首</button>
+      </div>
+      <button onclick="toggleLyrics()">显示/隐藏歌词</button>
+      <button onclick="logout()">退出登录</button>
+    </div>
+  </div>
+  <div id="lyricsContainer" class="lyrics-container">
+    <h3>歌词</h3>
+    <div id="lyricsText" class="lyrics-text"></div>
+  </div>
+</div>
 
-    <script>
-        const audio = document.getElementById('audio');
-        const progressBar = document.getElementById('progressBar');
-        const currentTime = document.getElementById('currentTime');
-        const songSelect = document.getElementById('songSelect');
-        const playPauseBtn = document.getElementById('playPauseBtn');
-        const volumeBar = document.getElementById('volumeBar');
-        const volumeDisplay = document.getElementById('volumeDisplay');
-        const albumArt = document.getElementById('albumArt');
+<script>
+  const audio = document.getElementById('audio');
+  const progressBar = document.getElementById('progressBar');
+  const currentTime = document.getElementById('currentTime');
+  const songSelect = document.getElementById('songSelect');
+  const playPauseBtn = document.getElementById('playPauseBtn');
+  const volumeBar = document.getElementById('volumeBar');
+  const volumeDisplay = document.getElementById('volumeDisplay');
+  const albumArt = document.getElementById('albumArt');
+  const lyricsContainer = document.getElementById('lyricsContainer');
+  const lyricsText = document.getElementById('lyricsText');
 
-        function login() {
-            var username = document.getElementById('username').value;
-            var password = document.getElementById('password').value;
-            if (username === "admin" && password === "1111") {
-                document.getElementById('loginForm').style.display = 'none';
-                document.getElementById('player').style.display = 'block';
-                changeSong(); // 加载第一首歌
-            } else {
-                alert("用户名或密码错误！");
-            }
-        }
+  // 模拟歌词数据
+  const lyrics = {
+    "song1.mp3": "作词 : 李荣浩\n" +
+            "\n" +
+            "作曲 : 王晓东\n" +
+            "\n" +
+            "编曲 : 李荣浩\n" +
+            "\n" +
+            "原唱 : 李荣浩\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "终于看到你穿着想要的那种婚纱\n" +
+            "\n" +
+            "你右手接过那捧花\n" +
+            "\n" +
+            "从今后换成他保护你 照顾你\n" +
+            "\n" +
+            "不论贫穷富裕 不论生老病疾\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "以后路上知道你会过得有模有样\n" +
+            "\n" +
+            "我不会中途先退场\n" +
+            "\n" +
+            "我要等那一幕 我知道我会哭\n" +
+            "\n" +
+            "也知道我哭是为给你祝福\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "爱过了就不遗憾 有什么好遗憾\n" +
+            "\n" +
+            "今后提起你的姓名 谈笑我也可以\n" +
+            "\n" +
+            "想到曾经在一起 争吵欢笑都发自内心\n" +
+            "\n" +
+            "爱情不止一种定义\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "错过了也不遗憾 只要是好答案\n" +
+            "\n" +
+            "别回头看 回头太难 你要变得勇敢\n" +
+            "\n" +
+            "这一辈子我欠你 如果来生还可能继续\n" +
+            "\n" +
+            "再用尽一生找寻 你在哪里\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "以后路上知道你会过得有模有样\n" +
+            "\n" +
+            "我不会中途先退场\n" +
+            "\n" +
+            "我要等那一幕 我知道我会哭\n" +
+            "\n" +
+            "也知道我哭是为给你祝福\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "爱过了就不遗憾 有什么好遗憾\n" +
+            "\n" +
+            "今后提起你的姓名 谈笑我也可以\n" +
+            "\n" +
+            "想到曾经在一起 争吵欢笑都发自内心\n" +
+            "\n" +
+            "爱情不止一种定义\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "错过了也不遗憾 只要是好答案\n" +
+            "\n" +
+            "别回头看 回头太难 你要变得勇敢\n" +
+            "\n" +
+            "这一辈子我欠你 如果来生还可能继续\n" +
+            "\n" +
+            "再用尽一生找寻 你在哪里\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "Ah\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "错过了也不遗憾 只要是好答案\n" +
+            "\n" +
+            "别回头看 回头太难 你要变得勇敢\n" +
+            "\n" +
+            "这一辈子我欠你 如果来生还可能继续\n" +
+            "\n" +
+            "再用尽一生找寻 你在哪里\n" +
+            "\n",
+    "song2.mp3": "作词 : 易家扬\n" +
+            "\n" +
+            "作曲 : 林俊杰\n" +
+            "\n" +
+            "编曲 : Martin Tang\n" +
+            "\n" +
+            "制作人 : 林俊杰\n" +
+            "\n" +
+            "孤单看天上那朵云呢 银灰色\n" +
+            "\n" +
+            "它安静的俯瞰着我\n" +
+            "\n" +
+            "失散的爱它飘浮着呢 旅行着\n" +
+            "\n" +
+            "想飞开但又依依不舍\n" +
+            "\n" +
+            "魔术般的 定在那儿 特别神秘的\n" +
+            "\n" +
+            "剪一片云拽着 纪念曾珍惜的\n" +
+            "\n" +
+            "就此远去了 但是心还悬着\n" +
+            "\n" +
+            "剪一片云爱着\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "我喜欢独自记得成为一个收藏者\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "偶尔怀念她 也不错\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "天空的叹息没有颜色 狠心的\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "钻进了我的心喊我\n" +
+            "\n" +
+            "记忆很麻烦也很苦涩 丢下呢\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "云没有名字像个孤儿\n" +
+            "\n" +
+            "看似快乐 流浪惯了 这么说它真的真的不负责\n" +
+            "\n" +
+            "剪一片云拽着 纪念曾珍惜的\n" +
+            "\n" +
+            "就此远去了 但是心还悬着\n" +
+            "\n" +
+            "剪一片云爱着\n" +
+            "\n" +
+            "我喜欢独自记得成为一个收藏者\n" +
+            "\n" +
+            "偶尔怀念她\n" +
+            "\n" +
+            "剪一片云拽着 纪念曾珍惜的\n" +
+            "\n" +
+            "就此远去了 但是心还悬着\n" +
+            "\n" +
+            "剪一片云爱着\n" +
+            "\n" +
+            "我喜欢独自记得成为一个收藏者\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "偶而怀念她 也不错\n" +
+            "\n" +
+            "以前深爱的 现在呢\n" +
+            "\n" +
+            " \n" +
+            "\n" +
+            "剪下的云呢 隐形了",
+    "song3.mp3": "作词 : 薛之谦\n" +
+            "\n" +
+            "作曲 : 薛之谦\n" +
+            "\n" +
+            "我该规矩地 跳入每格\n" +
+            "\n" +
+            "我好像还记得 愿望是什么\n" +
+            "\n" +
+            "挡住的 自行车 一个色\n" +
+            "\n" +
+            "我在叛逆地 坚持什么\n" +
+            "\n" +
+            "用我仅剩的 硬币做选择\n" +
+            "\n" +
+            "反正我 也没去处要叵测\n" +
+            "\n" +
+            "原谅我可好\n" +
+            "\n" +
+            "我傲慢的青春\n" +
+            "\n" +
+            "在触摸里奔跑 在黑夜里舞蹈\n" +
+            "\n" +
+            "你们嘲笑的船会停靠\n" +
+            "\n" +
+            "原谅我可好\n" +
+            "\n" +
+            "我失陪的青春\n" +
+            "\n" +
+            "最遗憾的是你 用最后的距离\n" +
+            "\n" +
+            "目送我 躁动的远离\n" +
+            "\n" +
+            "满是歉意\n" +
+            "\n" +
+            "我在尝试着 放弃哪格\n" +
+            "\n" +
+            "可是幼稚的 愿望多难得\n" +
+            "\n" +
+            "以前的 自行车 五颜六色\n" +
+            "\n" +
+            "我该经历的 皮毛有了\n" +
+            "\n" +
+            "我可以复杂地 介绍我了\n" +
+            "\n" +
+            "电视里 我的英雄 过期了\n" +
+            "\n" +
+            "原谅我可好\n" +
+            "\n" +
+            "我傲慢的青春\n" +
+            "\n" +
+            "在触摸里奔跑 在黑夜里舞蹈\n" +
+            "\n" +
+            "你们嘲笑的船会停靠\n" +
+            "\n" +
+            "原谅我可好\n" +
+            "\n" +
+            "我失陪的青春\n" +
+            "\n" +
+            "最遗憾的是你 用婉转的距离\n" +
+            "\n" +
+            "守着我 不安的远离\n" +
+            "\n" +
+            "再无归期\n" +
+            "\n" +
+            "嘲笑我可好\n" +
+            "\n" +
+            "我幼稚的青春\n" +
+            "\n" +
+            "用木剑来争吵 为尊严而摔倒\n" +
+            "\n" +
+            "不能让的 咬着牙也不放掉\n" +
+            "\n" +
+            "原谅我可好\n" +
+            "\n" +
+            "我违背的青春\n" +
+            "\n" +
+            "在拥挤的人潮 我妥协了多少\n" +
+            "\n" +
+            "一直到让我什么也不曾 得到\n" +
+            "\n" +
+            "原谅我可好\n" +
+            "\n" +
+            "原谅我可好\n" +
+            "\n" +
+            "原谅我可好 我逝去的青春"
+  };
 
-        function logout() {
-            document.getElementById('loginForm').style.display = 'block';
-            document.getElementById('player').style.display = 'none';
-            document.getElementById('username').value = '';
-            document.getElementById('password').value = '';
-            audio.pause();
-        }
+  function login() {
+    var username = document.getElementById('username').value;
+    var password = document.getElementById('password').value;
+    if (username === "admin" && password === "1111") {
+      document.getElementById('loginForm').style.display = 'none';
+      document.getElementById('player').style.display = 'block';
+      changeSong(); // 加载第一首歌
+    } else {
+      alert("用户名或密码错误！");
+    }
+  }
 
-        function changeSong() {
-            audio.src = songSelect.value;
-            audio.play();
-            updatePlayPauseButton();
-            updateAlbumArt();
-        }
+  function logout() {
+    document.getElementById('loginForm').style.display = 'block';
+    document.getElementById('player').style.display = 'none';
+    document.getElementById('username').value = '';
+    document.getElementById('password').value = '';
+    audio.pause();
+    lyricsContainer.style.display = 'none';
+  }
 
-        function togglePlay() {
-            if (audio.paused) {
-                audio.play();
-            } else {
-                audio.pause();
-            }
-            updatePlayPauseButton();
-        }
+  function changeSong() {
+    audio.src = songSelect.value;
+    audio.play();
+    updatePlayPauseButton();
+    updateAlbumArt();
+    updateLyrics();
+  }
 
-        function updatePlayPauseButton() {
-            playPauseBtn.textContent = audio.paused ? '播放' : '暂停';
-        }
+  function togglePlay() {
+    if (audio.paused) {
+      audio.play();
+    } else {
+      audio.pause();
+    }
+    updatePlayPauseButton();
+  }
 
-        function previousSong() {
-            songSelect.selectedIndex = (songSelect.selectedIndex - 1 + songSelect.options.length) % songSelect.options.length;
-            changeSong();
-        }
+  function updatePlayPauseButton() {
+    playPauseBtn.textContent = audio.paused ? '播放' : '暂停';
+  }
 
-        function nextSong() {
-            songSelect.selectedIndex = (songSelect.selectedIndex + 1) % songSelect.options.length;
-            changeSong();
-        }
+  function previousSong() {
+    songSelect.selectedIndex = (songSelect.selectedIndex - 1 + songSelect.options.length) % songSelect.options.length;
+    changeSong();
+  }
 
-        function updateAlbumArt() {
-            const randomColor = Math.floor(Math.random()*16777215).toString(16);
-            albumArt.style.backgroundColor = "#" + randomColor;
-            albumArt.textContent = songSelect.options[songSelect.selectedIndex].text;
-        }
+  function nextSong() {
+    songSelect.selectedIndex = (songSelect.selectedIndex + 1) % songSelect.options.length;
+    changeSong();
+  }
 
-        audio.addEventListener('timeupdate', function() {
-            const duration = audio.duration;
-            const currentTimeValue = audio.currentTime;
-            progressBar.max = duration;
-            progressBar.value = currentTimeValue;
-            currentTime.textContent = formatTime(currentTimeValue) + ' / ' + formatTime(duration);
-        });
+  function updateAlbumArt() {
+    const randomColor = Math.floor(Math.random()*16777215).toString(16);
+    albumArt.style.backgroundColor = "#" + randomColor;
+    albumArt.textContent = songSelect.options[songSelect.selectedIndex].text;
+  }
 
-        progressBar.addEventListener('input', function() {
-            audio.currentTime = progressBar.value;
-        });
+  function toggleLyrics() {
+    if (lyricsContainer.style.display === 'none' || lyricsContainer.style.display === '') {
+      lyricsContainer.style.display = 'block';
+    } else {
+      lyricsContainer.style.display = 'none';
+    }
+  }
 
-        volumeBar.addEventListener('input', function() {
-            audio.volume = volumeBar.value;
-            volumeDisplay.textContent = Math.round(volumeBar.value * 100) + '%';
-        });
+  function updateLyrics() {
+    const currentSong = songSelect.value;
+    lyricsText.textContent = lyrics[currentSong] || "暂无歌词";
+  }
 
-        function formatTime(time) {
-            const minutes = Math.floor(time / 60);
-            const seconds = Math.floor(time % 60);
-            return minutes + ':' + (seconds < 10 ? '0' : '') + seconds;
-        }
-         // 新增：监听音频播放结束事件
-        audio.addEventListener('ended', function() {
-            nextSong();
-        });
+  audio.addEventListener('timeupdate', function() {
+    const duration = audio.duration;
+    const currentTimeValue = audio.currentTime;
+    progressBar.max = duration;
+    progressBar.value = currentTimeValue;
+    currentTime.textContent = formatTime(currentTimeValue) + ' / ' + formatTime(duration);
+  });
 
-        // 初始显示登录表单
-        document.getElementById('loginForm').style.display = 'block';
-    </script>
+  progressBar.addEventListener('input', function() {
+    audio.currentTime = progressBar.value;
+  });
+
+  volumeBar.addEventListener('input', function() {
+    audio.volume = volumeBar.value;
+    volumeDisplay.textContent = Math.round(volumeBar.value * 100) + '%';
+  });
+
+  function formatTime(time) {
+    const minutes = Math.floor(time / 60);
+    const seconds = Math.floor(time % 60);
+    return minutes + ':' + (seconds < 10 ? '0' : '') + seconds;
+  }
+
+  // 监听音频播放结束事件
+  audio.addEventListener('ended', function() {
+    nextSong();
+  });
+
+  // 初始显示登录表单
+  document.getElementById('loginForm').style.display = 'block';
+</script>
 </body>
 </html>
