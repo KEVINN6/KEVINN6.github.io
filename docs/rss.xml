@@ -1,3 +1,31 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>K's Blog</title><link>https://KEVINN6.github.io</link><description>kevinn's Blog</description><copyright>K's Blog</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://avatars.githubusercontent.com/u/135682176?v=4&amp;size=64</url><title>avatar</title><link>https://KEVINN6.github.io</link></image><lastBuildDate>Mon, 20 Apr 2026 14:24:38 +0000</lastBuildDate><managingEditor>K's Blog</managingEditor><ttl>60</ttl><webMaster>K's Blog</webMaster><item><title>Test1</title><link>https://KEVINN6.github.io/post/Test1.html</link><description>First blog
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>K's Blog</title><link>https://KEVINN6.github.io</link><description>kevinn's Blog</description><copyright>K's Blog</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://avatars.githubusercontent.com/u/135682176?v=4&amp;size=64</url><title>avatar</title><link>https://KEVINN6.github.io</link></image><lastBuildDate>Tue, 21 Apr 2026 05:46:37 +0000</lastBuildDate><managingEditor>K's Blog</managingEditor><ttl>60</ttl><webMaster>K's Blog</webMaster><item><title>lombok后端导入问题</title><link>https://KEVINN6.github.io/post/lombok-hou-duan-dao-ru-wen-ti.html</link><description># lombok在pom导入dependency不生效问题
+### dependency部分代码
+```java
+        &lt;dependency&gt;
+            &lt;groupId&gt;org.projectlombok&lt;/groupId&gt;
+            &lt;artifactId&gt;lombok&lt;/artifactId&gt;
+            &lt;version&gt;1.18.36&lt;/version&gt;
+            &lt;scope&gt;provided&lt;/scope&gt;
+        &lt;/dependency&gt;
+```
+
+### 解决方式
+1.导入dependency的同时引入**plugin**
+```java
+            &lt;plugin&gt;
+                &lt;groupId&gt;org.apache.maven.plugins&lt;/groupId&gt;
+                &lt;artifactId&gt;maven-compiler-plugin&lt;/artifactId&gt;
+                &lt;configuration&gt;
+                    &lt;annotationProcessorPaths&gt;
+                        &lt;path&gt;
+                            &lt;groupId&gt;org.projectlombok&lt;/groupId&gt;
+                            &lt;artifactId&gt;lombok&lt;/artifactId&gt;
+                            &lt;version&gt;1.18.36&lt;/version&gt;
+                        &lt;/path&gt;
+                    &lt;/annotationProcessorPaths&gt;
+                &lt;/configuration&gt;
+            &lt;/plugin&gt;
+```
+2.在使用到的类前面加`@Data`。</description><guid isPermaLink="true">https://KEVINN6.github.io/post/lombok-hou-duan-dao-ru-wen-ti.html</guid><pubDate>Tue, 21 Apr 2026 05:46:07 +0000</pubDate></item><item><title>Test1</title><link>https://KEVINN6.github.io/post/Test1.html</link><description>First blog
 &lt;img width='4742' height='3557' alt='Image' src='https://github.com/user-attachments/assets/d96cdf98-aee5-4e49-8177-7329deb8832d' /&gt;。</description><guid isPermaLink="true">https://KEVINN6.github.io/post/Test1.html</guid><pubDate>Mon, 20 Apr 2026 14:17:57 +0000</pubDate></item></channel></rss>
