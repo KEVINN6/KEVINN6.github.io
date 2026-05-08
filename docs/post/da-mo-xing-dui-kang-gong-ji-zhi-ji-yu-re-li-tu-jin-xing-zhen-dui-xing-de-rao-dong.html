@@ -1,0 +1,2012 @@
+<!DOCTYPE html>
+<html data-color-mode="light" data-dark-theme="dark" data-light-theme="light" lang="zh-CN">
+<head>
+    <meta content="text/html; charset=utf-8" http-equiv="content-type" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <link href='https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/Primer/21.0.7/primer.css' rel='stylesheet' />
+    <script src='https://blog.meekdai.com/Gmeek/plugins/GmeekVercount.js'></script>
+    <link rel="icon" href="https://avatars.githubusercontent.com/u/135682176?v=4&size=64"><script>
+        let theme = localStorage.getItem("meek_theme") || "light";
+        document.documentElement.setAttribute("data-color-mode", theme);
+    </script>
+<meta name="description" content="# 大模型对抗攻击之基于热力图进行针对性的扰动
+
+<img width='1588' height='485' alt='Image' src='https://github.com/user-attachments/assets/022af6fb-fdfa-4774-9700-a48ef3a781ae' />
+将扰动与生成的热力图对应的矩阵掩码相乘再与原图进行叠加
+$adv\_image = image\_org + \delta \times mask$ 
+
+### 完整代码如下：
+```python
+import os
+import json
+import hashlib
+import random
+import torchvision.transforms as transforms
+import numpy as np
+import torch
+import torchvision
+from PIL import Image, ImageFilter  # [新增] 引入 ImageFilter 用于掩码平滑
+import hydra
+from omegaconf import DictConfig
+import os
+from config_schema import MainConfig
+from functools import partial
+from typing import List, Dict, Optional
+from torch import nn
+from pytorch_lightning import seed_everything
+import wandb
+from omegaconf import OmegaConf
+from tqdm import tqdm
+import time
+
+from rembg import remove  # [新增] 引入 rembg 进行主体提取
+
+from surrogates import (
+    ClipB16FeatureExtractor,
+    ClipL336FeatureExtractor,
+    ClipB32FeatureExtractor,
+    ClipLaionFeatureExtractor,
+    EnsembleFeatureLoss,
+    EnsembleFeatureExtractor,
+)
+
+from utils import hash_training_config, setup_wandb, ensure_dir
+
+# Mapping from backbone names to model classes
+BACKBONE_MAP: Dict[str, type] = {
+    'L336': ClipL336FeatureExtractor,
+    'B16': ClipB16FeatureExtractor,
+    'B32': ClipB32FeatureExtractor,
+    'Laion': ClipLaionFeatureExtractor,
+}
+
+
+def get_models(cfg: MainConfig):
+    '''Get models based on configuration.
+
+    Args:
+        cfg: Configuration object containing model settings
+
+    Returns:
+        Tuple of (feature_extractor, list of models)
+
+    Raises:
+        ValueError: If ensemble=False but multiple backbones specified
+    '''
+    if not cfg.model.ensemble and len(cfg.model.backbone) > 1:
+        raise ValueError('When ensemble=False, only one backbone can be specified')
+
+    models = []
+    for backbone_name in cfg.model.backbone:
+        if backbone_name not in BACKBONE_MAP:
+            raise ValueError(
+                f'Unknown backbone: {backbone_name}. Valid options are: {list(BACKBONE_MAP.keys())}'
+            )
+        model_class = BACKBONE_MAP[backbone_name]
+        model = model_class().eval().to(cfg.model.device).requires_grad_(False)
+        models.append(model)
+
+    if cfg.model.ensemble:
+        ensemble_extractor = EnsembleFeatureExtractor(models)
+    else:
+        ensemble_extractor = models[0]  # Use single model directly
+
+    return ensemble_extractor, models
+
+
+def get_ensemble_loss(cfg: MainConfig, models: List[nn.Module]):
+    ensemble_loss = EnsembleFeatureLoss(models)
+    return ensemble_loss
+
+
+def set_environment(seed=2023):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# Transform PIL.Image to PyTorch Tensor
+def to_tensor(pic):
+    mode_to_nptype = {'I': np.int32, 'I;16': np.int16, 'F': np.float32}
+    img = torch.from_numpy(
+        np.array(pic, mode_to_nptype.get(pic.mode, np.uint8), copy=True)
+    )
+    img = img.view(pic.size[1], pic.size[0], len(pic.getbands()))
+    img = img.permute((2, 0, 1)).contiguous()
+    return img.to(dtype=torch.get_default_dtype())
+
+
+# Dataset with image paths
+class ImageFolderWithPaths(torchvision.datasets.ImageFolder):
+    def __getitem__(self, index):
+        original_tuple = super().__getitem__(index)
+        path, _ = self.samples[index]
+        return original_tuple + (path,)
+
+
+# ================= [新增] 动态生成热力图掩码函数 =================
+def generate_batch_masks_on_the_fly(path_list, cfg, device):
+    masks = []
+    for p in path_list:
+        raw_image = Image.open(p).convert('RGB')
+        mask_image = remove(raw_image, only_mask=True)
+        blurred_mask = mask_image.filter(ImageFilter.GaussianBlur(radius=10))
+        mask_tensor = transforms.ToTensor()(blurred_mask.convert('L')).to(device)
+        mask_tensor = transforms.Resize((cfg.model.input_res, cfg.model.input_res))(mask_tensor)
+        masks.append(mask_tensor)
+    return torch.stack(masks)
+# ================================================================
+
+
+@hydra.main(version_base=None, config_path='config', config_name='ensemble_3models')
+def main(cfg: MainConfig):
+    set_environment()
+
+    # Initialize wandb using shared utility
+    setup_wandb(cfg, tags=['image_generation'])
+    # Define metrics relationship for logging multiple images
+    wandb.define_metric('epoch')
+    wandb.define_metric('*', step_metric='epoch')
+
+    ensemble_extractor, models = get_models(cfg)
+    ensemble_loss = get_ensemble_loss(cfg, models)
+
+    transform_fn = transforms.Compose(
+        [
+            transforms.Resize(
+                cfg.model.input_res,
+                interpolation=torchvision.transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.CenterCrop(cfg.model.input_res),
+            transforms.Lambda(lambda img: img.convert('RGB')),
+            transforms.Lambda(lambda img: to_tensor(img)),
+        ]
+    )
+
+    clean_data = ImageFolderWithPaths(cfg.data.cle_data_path, transform=transform_fn)
+    target_data = ImageFolderWithPaths(cfg.data.tgt_data_path, transform=transform_fn)
+
+    data_loader_imagenet = torch.utils.data.DataLoader(
+        clean_data, batch_size=cfg.data.batch_size, shuffle=False
+    )
+    data_loader_target = torch.utils.data.DataLoader(
+        target_data, batch_size=cfg.data.batch_size, shuffle=False
+    )
+
+    print('Using source crop:', cfg.model.use_source_crop)
+    print('Using target crop:', cfg.model.use_target_crop)
+
+    source_crop = (
+        transforms.RandomResizedCrop(cfg.model.input_res, scale=cfg.model.crop_scale)
+        if cfg.model.use_source_crop
+        else torch.nn.Identity()
+    )
+    target_crop = (
+        transforms.RandomResizedCrop(cfg.model.input_res, scale=cfg.model.crop_scale)
+        if cfg.model.use_target_crop
+        else torch.nn.Identity()
+    )
+
+    for i, ((image_org, _, path_org), (image_tgt, _, path_tgt)) in enumerate(
+        zip(data_loader_imagenet, data_loader_target)
+    ):
+        if cfg.data.batch_size * (i + 1) > cfg.data.num_samples:
+            break
+
+        print(f'\nProcessing image {i+1}/{cfg.data.num_samples//cfg.data.batch_size}')
+
+        # [新增] 动态生成矩阵掩码
+        mask = generate_batch_masks_on_the_fly(path_org, cfg, cfg.model.device)
+
+        attack_imgpair(
+            cfg=cfg,
+            ensemble_extractor=ensemble_extractor,
+            ensemble_loss=ensemble_loss,
+            source_crop=source_crop,
+            img_index=i,
+            image_org=image_org,
+            path_org=path_org,
+            image_tgt=image_tgt,
+            target_crop=target_crop,
+            mask=mask  # [新增] 传入 mask
+        )
+
+    wandb.finish()
+
+
+def attack_imgpair(
+    cfg: MainConfig,
+    ensemble_extractor: nn.Module,
+    ensemble_loss: nn.Module,
+    source_crop: Optional[transforms.RandomResizedCrop],
+    target_crop: Optional[transforms.RandomResizedCrop],
+    img_index: int,
+    image_org: torch.Tensor,
+    path_org: List[str],
+    image_tgt: torch.Tensor,
+    mask: torch.Tensor  # [新增] 接收 mask
+):
+    image_org, image_tgt = image_org.to(cfg.model.device), image_tgt.to(
+        cfg.model.device
+    )
+    attack_type = cfg.attack
+    attack_fn = {
+        'fgsm': fgsm_attack,
+        'mifgsm': mifgsm_attack,
+        'pgd': pgd_attack,
+    }[attack_type]
+    adv_image = attack_fn(
+        cfg=cfg,
+        ensemble_extractor=ensemble_extractor,
+        ensemble_loss=ensemble_loss,
+        source_crop=source_crop,
+        target_crop=target_crop,
+        img_index=img_index,
+        image_org=image_org,
+        image_tgt=image_tgt,
+        mask=mask  # [新增] 传入 mask 给具体攻击函数
+    )
+
+    # Get config hash for output directory
+    config_hash = hash_training_config(cfg)
+    unique_hash = f'{config_hash}_{time.strftime('%m%d_%H%M%S')}'
+
+    # Save images
+    for path_idx in range(len(path_org)):
+        folder, name = (
+            path_org[path_idx].split('/')[-2],
+            path_org[path_idx].split('/')[-1],
+        )
+        # Use config hash in output path
+        folder_to_save = os.path.join(cfg.data.output, 'img', unique_hash, folder)
+        ensure_dir(folder_to_save)
+
+        if 'JPEG' in name:
+            torchvision.utils.save_image(
+                adv_image[path_idx], os.path.join(folder_to_save, name[:-4]) + 'png'
+            )
+        elif 'png' in name:
+            torchvision.utils.save_image(
+                adv_image[path_idx], os.path.join(folder_to_save, name)
+            )
+
+
+def log_metrics(pbar, metrics, img_index, epoch=None):
+    '''
+    Log metrics to progress bar and wandb.
+
+    Args:
+        pbar: tqdm progress bar to update
+        metrics: Dictionary of metrics to log
+        img_index: Index of the image (for wandb logging)
+        epoch: Optional epoch number for logging
+    '''
+    # Format metrics for progress bar
+    pbar_metrics = {
+        k: f'{v:.5f}' if 'sim' in k else f'{v:.3f}' for k, v in metrics.items()
+    }
+    pbar.set_postfix(pbar_metrics)
+
+    # Prepare wandb metrics with image index
+    wandb_metrics = {f'img{img_index}_{k}': v for k, v in metrics.items()}
+    if epoch is not None:
+        wandb_metrics['epoch'] = epoch
+
+    # Log to wandb
+    wandb.log(wandb_metrics)
+
+
+def fgsm_attack(
+    cfg: MainConfig,
+    ensemble_extractor: nn.Module,
+    ensemble_loss: nn.Module,
+    source_crop: Optional[transforms.RandomResizedCrop],
+    target_crop: Optional[transforms.RandomResizedCrop],
+    img_index: int,
+    image_org: torch.Tensor,
+    image_tgt: torch.Tensor,
+    mask: torch.Tensor  # [新增] 接收 mask
+):
+    '''
+       Perform FGSM attack on the image to generate adversarial examples.
+
+       Args:
+           cfg: Configuration parameters
+           ensemble_extractor: Ensemble feature extractor model
+           ensemble_loss: Ensemble loss function
+           source_crop: Optional transform for cropping source images
+           target_crop: Optional transform for cropping target images
+           i: Index of the image (for logging)
+           image_org: Original source image tensor
+           image_tgt: Target image tensor to match features with
+
+       Returns:
+           torch.Tensor: Generated adversarial image
+       '''
+    # Initialize perturbation
+    delta = torch.zeros_like(image_org, requires_grad=True)
+
+    # Progress bar for optimization
+    pbar = tqdm(range(cfg.optim.steps), desc=f'Attack progress')
+
+    # Main optimization loop
+    for epoch in pbar:
+
+        with torch.no_grad():
+            ensemble_loss.set_ground_truth(target_crop(image_tgt))
+
+        # Forward pass
+        # [修改点] 将矩阵掩码和生成的扰动相乘，使得只有 mask 区域的特征被抽取用于计算 similarity
+        adv_image = image_org + (delta * mask)
+        adv_features = ensemble_extractor(adv_image)
+
+        # Calculate metrics (监控实际生效的扰动量)
+        metrics = {
+            'max_delta': torch.max(torch.abs(delta * mask)).item(),
+            'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+        }
+
+        # Calculate loss based on configuration
+        global_sim = ensemble_loss(adv_features)
+        metrics['global_similarity'] = global_sim.item()
+
+        if cfg.model.use_source_crop:
+            # If using source crop, calculate additional local similarity
+            local_cropped = source_crop(adv_image)
+            local_features = ensemble_extractor(local_cropped)
+            local_sim = ensemble_loss(local_features)
+            loss = local_sim
+            metrics['local_similarity'] = local_sim.item()
+        else:
+            # Otherwise use global similarity as loss
+            loss = global_sim
+
+        # Log current metrics
+        log_metrics(pbar, metrics, img_index, epoch)
+
+        grad = torch.autograd.grad(loss, delta, create_graph=False)[0]
+
+        # Update delta using FGSM
+        delta.data = torch.clamp(
+            delta + cfg.optim.alpha * torch.sign(grad),
+            min=-cfg.optim.epsilon,
+            max=cfg.optim.epsilon,
+        )
+        # [新增点] 强制过滤背景梯度，确保 delta 在下一步依然被完全约束
+        delta.data = delta.data * mask
+
+    # Create final adversarial image
+    # [修改点] 最终输出也加上 mask 约束
+    adv_image = image_org + (delta * mask)
+    adv_image = torch.clamp(adv_image / 255.0, 0.0, 1.0)
+
+    # Log final perturbation metrics
+    final_metrics = {
+        'max_delta': torch.max(torch.abs(delta * mask)).item(),
+        'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+    }
+    log_metrics(pbar, final_metrics, img_index)
+
+    return adv_image
+
+
+def mifgsm_attack(
+    cfg: MainConfig,
+    ensemble_extractor: nn.Module,
+    ensemble_loss: nn.Module,
+    source_crop: Optional[transforms.RandomResizedCrop],
+    target_crop: Optional[transforms.RandomResizedCrop],
+    img_index: int,
+    image_org: torch.Tensor,
+    image_tgt: torch.Tensor,
+    mask: torch.Tensor  # [新增] 接收 mask
+):
+    '''
+        Perform MI-FGSM attack on the image to generate adversarial examples.
+
+        Args:
+            cfg: Configuration parameters
+            ensemble_extractor: Ensemble feature extractor model
+            ensemble_loss: Ensemble loss function
+            source_crop: Optional transform for cropping source images
+            target_crop: Optional transform for cropping target images
+            i: Index of the image (for logging)
+            image_org: Original source image tensor
+            image_tgt: Target image tensor to match features with
+
+        Returns:
+            torch.Tensor: Generated adversarial image
+        '''
+    # Initialize perturbation and momentum
+    delta = torch.zeros_like(image_org, requires_grad=True)
+    momentum = torch.zeros_like(image_org, requires_grad=False)
+
+    # Progress bar for optimization
+    pbar = tqdm(range(cfg.optim.steps), desc=f'Attack progress')
+
+    # Main optimization loop
+    for epoch in pbar:
+
+        with torch.no_grad():
+            ensemble_loss.set_ground_truth(target_crop(image_tgt))
+
+        # Forward pass
+        # [修改点] 将矩阵掩码和生成的扰动相乘
+        adv_image = image_org + (delta * mask)
+        adv_features = ensemble_extractor(adv_image)
+
+        # Calculate metrics
+        metrics = {
+            'max_delta': torch.max(torch.abs(delta * mask)).item(),
+            'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+        }
+
+        # Calculate loss based on configuration
+        global_sim = ensemble_loss(adv_features)
+        metrics['global_similarity'] = global_sim.item()
+
+        if cfg.model.use_source_crop:
+            # If using source crop, calculate additional local similarity
+            local_cropped = source_crop(adv_image)
+            local_features = ensemble_extractor(local_cropped)
+            local_sim = ensemble_loss(local_features)
+            loss = local_sim
+            metrics['local_similarity'] = local_sim.item()
+        else:
+            # Otherwise use global similarity as loss
+            loss = global_sim
+
+        log_metrics(pbar, metrics, img_index, epoch)
+
+        grad = torch.autograd.grad(loss, delta, create_graph=False)[0]
+
+        # MI-FGSM update
+        momentum = momentum * 0.9 + grad
+        delta.data = torch.clamp(
+            delta + cfg.optim.alpha * torch.sign(momentum),
+            min=-cfg.optim.epsilon,
+            max=cfg.optim.epsilon,
+        )
+        # [新增点] 强制约束 delta
+        delta.data = delta.data * mask
+
+    # Create final adversarial image
+    # [修改点] 最终输出约束
+    adv_image = image_org + (delta * mask)
+    adv_image = torch.clamp(adv_image / 255.0, 0.0, 1.0)
+
+    # Log final perturbation metrics
+    final_metrics = {
+        'max_delta': torch.max(torch.abs(delta * mask)).item(),
+        'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+    }
+    log_metrics(pbar, final_metrics, img_index)
+
+    return adv_image
+
+
+def pgd_attack(
+    cfg: MainConfig,
+    ensemble_extractor: nn.Module,
+    ensemble_loss: nn.Module,
+    source_crop: Optional[transforms.RandomResizedCrop],
+    target_crop: Optional[transforms.RandomResizedCrop],
+    img_index: int,
+    image_org: torch.Tensor,
+    image_tgt: torch.Tensor,
+    mask: torch.Tensor  # [新增] 接收 mask
+):
+    '''
+       Perform PGD attack on the image to generate adversarial examples.
+
+       Args:
+           cfg: Configuration parameters
+           ensemble_extractor: Ensemble feature extractor model
+           ensemble_loss: Ensemble loss function
+           source_crop: Optional transform for cropping source images
+           target_crop: Optional transform for cropping target images
+           i: Index of the image (for logging)
+           image_org: Original source image tensor
+           image_tgt: Target image tensor to match features with
+
+       Returns:
+           torch.Tensor: Generated adversarial image
+       '''
+    # Initialize perturbation and momentum
+    delta = torch.zeros_like(image_org, requires_grad=True)
+    optimizer = torch.optim.Adam([delta], lr=cfg.optim.alpha)
+
+    # Progress bar for optimization
+    pbar = tqdm(range(cfg.optim.steps), desc=f'Attack progress')
+
+    # Main optimization loop
+    for epoch in pbar:
+
+        with torch.no_grad():
+            ensemble_loss.set_ground_truth(target_crop(image_tgt))
+
+        # Forward pass
+        # [修改点] 将矩阵掩码和生成的扰动相乘
+        adv_image = image_org + (delta * mask)
+        adv_features = ensemble_extractor(adv_image)
+
+        # Calculate metrics
+        metrics = {
+            'max_delta': torch.max(torch.abs(delta * mask)).item(),
+            'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+        }
+
+        # Calculate loss based on configuration
+        global_sim = ensemble_loss(adv_features)
+        metrics['global_similarity'] = global_sim.item()
+
+        if cfg.model.use_source_crop:
+            # If using source crop, calculate additional local similarity
+            local_cropped = source_crop(adv_image)
+            local_features = ensemble_extractor(local_cropped)
+            local_sim = ensemble_loss(local_features)
+            loss = -local_sim # since we want to maximize the loss
+            metrics['local_similarity'] = local_sim.item()
+        else:
+            # Otherwise use global similarity as loss
+            loss = -global_sim
+
+        log_metrics(pbar, metrics, img_index, epoch)
+
+        optimizer.zero_grad()
+        loss.backward()
+
+        # PGD update
+        optimizer.step()
+        delta.data = torch.clamp(
+            delta,
+            min=-cfg.optim.epsilon,
+            max=cfg.optim.epsilon,
+        )
+        # [新增点] 强制约束 delta
+        delta.data = delta.data * mask
+
+    # Create final adversarial image
+    # [修改点] 最终输出约束
+    adv_image = image_org + (delta * mask)
+    adv_image = torch.clamp(adv_image / 255.0, 0.0, 1.0)
+
+    # Log final perturbation metrics
+    final_metrics = {
+        'max_delta': torch.max(torch.abs(delta * mask)).item(),
+        'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+    }
+    log_metrics(pbar, final_metrics, img_index)
+
+    return adv_image
+
+
+if __name__ == '__main__':
+    main()
+```
+### 修改镜像并运行
+```python
+export HF_ENDPOINT=https://hf-mirror.com
+python adversarial_test.py
+```
+### 使用与原文相同的模型进行攻击效果测试
+```python
+python blackbox_text_generation.py -m blackbox.model_name=gpt4o
+python gpt_evaluate.py -m blackbox.model_name=gpt4o
+python keyword_matching_gpt.py -m blackbox.model_name=gpt4o
+```。">
+<meta property="og:title" content="大模型对抗攻击之基于热力图进行针对性的扰动">
+<meta property="og:description" content="# 大模型对抗攻击之基于热力图进行针对性的扰动
+
+<img width='1588' height='485' alt='Image' src='https://github.com/user-attachments/assets/022af6fb-fdfa-4774-9700-a48ef3a781ae' />
+将扰动与生成的热力图对应的矩阵掩码相乘再与原图进行叠加
+$adv\_image = image\_org + \delta \times mask$ 
+
+### 完整代码如下：
+```python
+import os
+import json
+import hashlib
+import random
+import torchvision.transforms as transforms
+import numpy as np
+import torch
+import torchvision
+from PIL import Image, ImageFilter  # [新增] 引入 ImageFilter 用于掩码平滑
+import hydra
+from omegaconf import DictConfig
+import os
+from config_schema import MainConfig
+from functools import partial
+from typing import List, Dict, Optional
+from torch import nn
+from pytorch_lightning import seed_everything
+import wandb
+from omegaconf import OmegaConf
+from tqdm import tqdm
+import time
+
+from rembg import remove  # [新增] 引入 rembg 进行主体提取
+
+from surrogates import (
+    ClipB16FeatureExtractor,
+    ClipL336FeatureExtractor,
+    ClipB32FeatureExtractor,
+    ClipLaionFeatureExtractor,
+    EnsembleFeatureLoss,
+    EnsembleFeatureExtractor,
+)
+
+from utils import hash_training_config, setup_wandb, ensure_dir
+
+# Mapping from backbone names to model classes
+BACKBONE_MAP: Dict[str, type] = {
+    'L336': ClipL336FeatureExtractor,
+    'B16': ClipB16FeatureExtractor,
+    'B32': ClipB32FeatureExtractor,
+    'Laion': ClipLaionFeatureExtractor,
+}
+
+
+def get_models(cfg: MainConfig):
+    '''Get models based on configuration.
+
+    Args:
+        cfg: Configuration object containing model settings
+
+    Returns:
+        Tuple of (feature_extractor, list of models)
+
+    Raises:
+        ValueError: If ensemble=False but multiple backbones specified
+    '''
+    if not cfg.model.ensemble and len(cfg.model.backbone) > 1:
+        raise ValueError('When ensemble=False, only one backbone can be specified')
+
+    models = []
+    for backbone_name in cfg.model.backbone:
+        if backbone_name not in BACKBONE_MAP:
+            raise ValueError(
+                f'Unknown backbone: {backbone_name}. Valid options are: {list(BACKBONE_MAP.keys())}'
+            )
+        model_class = BACKBONE_MAP[backbone_name]
+        model = model_class().eval().to(cfg.model.device).requires_grad_(False)
+        models.append(model)
+
+    if cfg.model.ensemble:
+        ensemble_extractor = EnsembleFeatureExtractor(models)
+    else:
+        ensemble_extractor = models[0]  # Use single model directly
+
+    return ensemble_extractor, models
+
+
+def get_ensemble_loss(cfg: MainConfig, models: List[nn.Module]):
+    ensemble_loss = EnsembleFeatureLoss(models)
+    return ensemble_loss
+
+
+def set_environment(seed=2023):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# Transform PIL.Image to PyTorch Tensor
+def to_tensor(pic):
+    mode_to_nptype = {'I': np.int32, 'I;16': np.int16, 'F': np.float32}
+    img = torch.from_numpy(
+        np.array(pic, mode_to_nptype.get(pic.mode, np.uint8), copy=True)
+    )
+    img = img.view(pic.size[1], pic.size[0], len(pic.getbands()))
+    img = img.permute((2, 0, 1)).contiguous()
+    return img.to(dtype=torch.get_default_dtype())
+
+
+# Dataset with image paths
+class ImageFolderWithPaths(torchvision.datasets.ImageFolder):
+    def __getitem__(self, index):
+        original_tuple = super().__getitem__(index)
+        path, _ = self.samples[index]
+        return original_tuple + (path,)
+
+
+# ================= [新增] 动态生成热力图掩码函数 =================
+def generate_batch_masks_on_the_fly(path_list, cfg, device):
+    masks = []
+    for p in path_list:
+        raw_image = Image.open(p).convert('RGB')
+        mask_image = remove(raw_image, only_mask=True)
+        blurred_mask = mask_image.filter(ImageFilter.GaussianBlur(radius=10))
+        mask_tensor = transforms.ToTensor()(blurred_mask.convert('L')).to(device)
+        mask_tensor = transforms.Resize((cfg.model.input_res, cfg.model.input_res))(mask_tensor)
+        masks.append(mask_tensor)
+    return torch.stack(masks)
+# ================================================================
+
+
+@hydra.main(version_base=None, config_path='config', config_name='ensemble_3models')
+def main(cfg: MainConfig):
+    set_environment()
+
+    # Initialize wandb using shared utility
+    setup_wandb(cfg, tags=['image_generation'])
+    # Define metrics relationship for logging multiple images
+    wandb.define_metric('epoch')
+    wandb.define_metric('*', step_metric='epoch')
+
+    ensemble_extractor, models = get_models(cfg)
+    ensemble_loss = get_ensemble_loss(cfg, models)
+
+    transform_fn = transforms.Compose(
+        [
+            transforms.Resize(
+                cfg.model.input_res,
+                interpolation=torchvision.transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.CenterCrop(cfg.model.input_res),
+            transforms.Lambda(lambda img: img.convert('RGB')),
+            transforms.Lambda(lambda img: to_tensor(img)),
+        ]
+    )
+
+    clean_data = ImageFolderWithPaths(cfg.data.cle_data_path, transform=transform_fn)
+    target_data = ImageFolderWithPaths(cfg.data.tgt_data_path, transform=transform_fn)
+
+    data_loader_imagenet = torch.utils.data.DataLoader(
+        clean_data, batch_size=cfg.data.batch_size, shuffle=False
+    )
+    data_loader_target = torch.utils.data.DataLoader(
+        target_data, batch_size=cfg.data.batch_size, shuffle=False
+    )
+
+    print('Using source crop:', cfg.model.use_source_crop)
+    print('Using target crop:', cfg.model.use_target_crop)
+
+    source_crop = (
+        transforms.RandomResizedCrop(cfg.model.input_res, scale=cfg.model.crop_scale)
+        if cfg.model.use_source_crop
+        else torch.nn.Identity()
+    )
+    target_crop = (
+        transforms.RandomResizedCrop(cfg.model.input_res, scale=cfg.model.crop_scale)
+        if cfg.model.use_target_crop
+        else torch.nn.Identity()
+    )
+
+    for i, ((image_org, _, path_org), (image_tgt, _, path_tgt)) in enumerate(
+        zip(data_loader_imagenet, data_loader_target)
+    ):
+        if cfg.data.batch_size * (i + 1) > cfg.data.num_samples:
+            break
+
+        print(f'\nProcessing image {i+1}/{cfg.data.num_samples//cfg.data.batch_size}')
+
+        # [新增] 动态生成矩阵掩码
+        mask = generate_batch_masks_on_the_fly(path_org, cfg, cfg.model.device)
+
+        attack_imgpair(
+            cfg=cfg,
+            ensemble_extractor=ensemble_extractor,
+            ensemble_loss=ensemble_loss,
+            source_crop=source_crop,
+            img_index=i,
+            image_org=image_org,
+            path_org=path_org,
+            image_tgt=image_tgt,
+            target_crop=target_crop,
+            mask=mask  # [新增] 传入 mask
+        )
+
+    wandb.finish()
+
+
+def attack_imgpair(
+    cfg: MainConfig,
+    ensemble_extractor: nn.Module,
+    ensemble_loss: nn.Module,
+    source_crop: Optional[transforms.RandomResizedCrop],
+    target_crop: Optional[transforms.RandomResizedCrop],
+    img_index: int,
+    image_org: torch.Tensor,
+    path_org: List[str],
+    image_tgt: torch.Tensor,
+    mask: torch.Tensor  # [新增] 接收 mask
+):
+    image_org, image_tgt = image_org.to(cfg.model.device), image_tgt.to(
+        cfg.model.device
+    )
+    attack_type = cfg.attack
+    attack_fn = {
+        'fgsm': fgsm_attack,
+        'mifgsm': mifgsm_attack,
+        'pgd': pgd_attack,
+    }[attack_type]
+    adv_image = attack_fn(
+        cfg=cfg,
+        ensemble_extractor=ensemble_extractor,
+        ensemble_loss=ensemble_loss,
+        source_crop=source_crop,
+        target_crop=target_crop,
+        img_index=img_index,
+        image_org=image_org,
+        image_tgt=image_tgt,
+        mask=mask  # [新增] 传入 mask 给具体攻击函数
+    )
+
+    # Get config hash for output directory
+    config_hash = hash_training_config(cfg)
+    unique_hash = f'{config_hash}_{time.strftime('%m%d_%H%M%S')}'
+
+    # Save images
+    for path_idx in range(len(path_org)):
+        folder, name = (
+            path_org[path_idx].split('/')[-2],
+            path_org[path_idx].split('/')[-1],
+        )
+        # Use config hash in output path
+        folder_to_save = os.path.join(cfg.data.output, 'img', unique_hash, folder)
+        ensure_dir(folder_to_save)
+
+        if 'JPEG' in name:
+            torchvision.utils.save_image(
+                adv_image[path_idx], os.path.join(folder_to_save, name[:-4]) + 'png'
+            )
+        elif 'png' in name:
+            torchvision.utils.save_image(
+                adv_image[path_idx], os.path.join(folder_to_save, name)
+            )
+
+
+def log_metrics(pbar, metrics, img_index, epoch=None):
+    '''
+    Log metrics to progress bar and wandb.
+
+    Args:
+        pbar: tqdm progress bar to update
+        metrics: Dictionary of metrics to log
+        img_index: Index of the image (for wandb logging)
+        epoch: Optional epoch number for logging
+    '''
+    # Format metrics for progress bar
+    pbar_metrics = {
+        k: f'{v:.5f}' if 'sim' in k else f'{v:.3f}' for k, v in metrics.items()
+    }
+    pbar.set_postfix(pbar_metrics)
+
+    # Prepare wandb metrics with image index
+    wandb_metrics = {f'img{img_index}_{k}': v for k, v in metrics.items()}
+    if epoch is not None:
+        wandb_metrics['epoch'] = epoch
+
+    # Log to wandb
+    wandb.log(wandb_metrics)
+
+
+def fgsm_attack(
+    cfg: MainConfig,
+    ensemble_extractor: nn.Module,
+    ensemble_loss: nn.Module,
+    source_crop: Optional[transforms.RandomResizedCrop],
+    target_crop: Optional[transforms.RandomResizedCrop],
+    img_index: int,
+    image_org: torch.Tensor,
+    image_tgt: torch.Tensor,
+    mask: torch.Tensor  # [新增] 接收 mask
+):
+    '''
+       Perform FGSM attack on the image to generate adversarial examples.
+
+       Args:
+           cfg: Configuration parameters
+           ensemble_extractor: Ensemble feature extractor model
+           ensemble_loss: Ensemble loss function
+           source_crop: Optional transform for cropping source images
+           target_crop: Optional transform for cropping target images
+           i: Index of the image (for logging)
+           image_org: Original source image tensor
+           image_tgt: Target image tensor to match features with
+
+       Returns:
+           torch.Tensor: Generated adversarial image
+       '''
+    # Initialize perturbation
+    delta = torch.zeros_like(image_org, requires_grad=True)
+
+    # Progress bar for optimization
+    pbar = tqdm(range(cfg.optim.steps), desc=f'Attack progress')
+
+    # Main optimization loop
+    for epoch in pbar:
+
+        with torch.no_grad():
+            ensemble_loss.set_ground_truth(target_crop(image_tgt))
+
+        # Forward pass
+        # [修改点] 将矩阵掩码和生成的扰动相乘，使得只有 mask 区域的特征被抽取用于计算 similarity
+        adv_image = image_org + (delta * mask)
+        adv_features = ensemble_extractor(adv_image)
+
+        # Calculate metrics (监控实际生效的扰动量)
+        metrics = {
+            'max_delta': torch.max(torch.abs(delta * mask)).item(),
+            'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+        }
+
+        # Calculate loss based on configuration
+        global_sim = ensemble_loss(adv_features)
+        metrics['global_similarity'] = global_sim.item()
+
+        if cfg.model.use_source_crop:
+            # If using source crop, calculate additional local similarity
+            local_cropped = source_crop(adv_image)
+            local_features = ensemble_extractor(local_cropped)
+            local_sim = ensemble_loss(local_features)
+            loss = local_sim
+            metrics['local_similarity'] = local_sim.item()
+        else:
+            # Otherwise use global similarity as loss
+            loss = global_sim
+
+        # Log current metrics
+        log_metrics(pbar, metrics, img_index, epoch)
+
+        grad = torch.autograd.grad(loss, delta, create_graph=False)[0]
+
+        # Update delta using FGSM
+        delta.data = torch.clamp(
+            delta + cfg.optim.alpha * torch.sign(grad),
+            min=-cfg.optim.epsilon,
+            max=cfg.optim.epsilon,
+        )
+        # [新增点] 强制过滤背景梯度，确保 delta 在下一步依然被完全约束
+        delta.data = delta.data * mask
+
+    # Create final adversarial image
+    # [修改点] 最终输出也加上 mask 约束
+    adv_image = image_org + (delta * mask)
+    adv_image = torch.clamp(adv_image / 255.0, 0.0, 1.0)
+
+    # Log final perturbation metrics
+    final_metrics = {
+        'max_delta': torch.max(torch.abs(delta * mask)).item(),
+        'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+    }
+    log_metrics(pbar, final_metrics, img_index)
+
+    return adv_image
+
+
+def mifgsm_attack(
+    cfg: MainConfig,
+    ensemble_extractor: nn.Module,
+    ensemble_loss: nn.Module,
+    source_crop: Optional[transforms.RandomResizedCrop],
+    target_crop: Optional[transforms.RandomResizedCrop],
+    img_index: int,
+    image_org: torch.Tensor,
+    image_tgt: torch.Tensor,
+    mask: torch.Tensor  # [新增] 接收 mask
+):
+    '''
+        Perform MI-FGSM attack on the image to generate adversarial examples.
+
+        Args:
+            cfg: Configuration parameters
+            ensemble_extractor: Ensemble feature extractor model
+            ensemble_loss: Ensemble loss function
+            source_crop: Optional transform for cropping source images
+            target_crop: Optional transform for cropping target images
+            i: Index of the image (for logging)
+            image_org: Original source image tensor
+            image_tgt: Target image tensor to match features with
+
+        Returns:
+            torch.Tensor: Generated adversarial image
+        '''
+    # Initialize perturbation and momentum
+    delta = torch.zeros_like(image_org, requires_grad=True)
+    momentum = torch.zeros_like(image_org, requires_grad=False)
+
+    # Progress bar for optimization
+    pbar = tqdm(range(cfg.optim.steps), desc=f'Attack progress')
+
+    # Main optimization loop
+    for epoch in pbar:
+
+        with torch.no_grad():
+            ensemble_loss.set_ground_truth(target_crop(image_tgt))
+
+        # Forward pass
+        # [修改点] 将矩阵掩码和生成的扰动相乘
+        adv_image = image_org + (delta * mask)
+        adv_features = ensemble_extractor(adv_image)
+
+        # Calculate metrics
+        metrics = {
+            'max_delta': torch.max(torch.abs(delta * mask)).item(),
+            'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+        }
+
+        # Calculate loss based on configuration
+        global_sim = ensemble_loss(adv_features)
+        metrics['global_similarity'] = global_sim.item()
+
+        if cfg.model.use_source_crop:
+            # If using source crop, calculate additional local similarity
+            local_cropped = source_crop(adv_image)
+            local_features = ensemble_extractor(local_cropped)
+            local_sim = ensemble_loss(local_features)
+            loss = local_sim
+            metrics['local_similarity'] = local_sim.item()
+        else:
+            # Otherwise use global similarity as loss
+            loss = global_sim
+
+        log_metrics(pbar, metrics, img_index, epoch)
+
+        grad = torch.autograd.grad(loss, delta, create_graph=False)[0]
+
+        # MI-FGSM update
+        momentum = momentum * 0.9 + grad
+        delta.data = torch.clamp(
+            delta + cfg.optim.alpha * torch.sign(momentum),
+            min=-cfg.optim.epsilon,
+            max=cfg.optim.epsilon,
+        )
+        # [新增点] 强制约束 delta
+        delta.data = delta.data * mask
+
+    # Create final adversarial image
+    # [修改点] 最终输出约束
+    adv_image = image_org + (delta * mask)
+    adv_image = torch.clamp(adv_image / 255.0, 0.0, 1.0)
+
+    # Log final perturbation metrics
+    final_metrics = {
+        'max_delta': torch.max(torch.abs(delta * mask)).item(),
+        'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+    }
+    log_metrics(pbar, final_metrics, img_index)
+
+    return adv_image
+
+
+def pgd_attack(
+    cfg: MainConfig,
+    ensemble_extractor: nn.Module,
+    ensemble_loss: nn.Module,
+    source_crop: Optional[transforms.RandomResizedCrop],
+    target_crop: Optional[transforms.RandomResizedCrop],
+    img_index: int,
+    image_org: torch.Tensor,
+    image_tgt: torch.Tensor,
+    mask: torch.Tensor  # [新增] 接收 mask
+):
+    '''
+       Perform PGD attack on the image to generate adversarial examples.
+
+       Args:
+           cfg: Configuration parameters
+           ensemble_extractor: Ensemble feature extractor model
+           ensemble_loss: Ensemble loss function
+           source_crop: Optional transform for cropping source images
+           target_crop: Optional transform for cropping target images
+           i: Index of the image (for logging)
+           image_org: Original source image tensor
+           image_tgt: Target image tensor to match features with
+
+       Returns:
+           torch.Tensor: Generated adversarial image
+       '''
+    # Initialize perturbation and momentum
+    delta = torch.zeros_like(image_org, requires_grad=True)
+    optimizer = torch.optim.Adam([delta], lr=cfg.optim.alpha)
+
+    # Progress bar for optimization
+    pbar = tqdm(range(cfg.optim.steps), desc=f'Attack progress')
+
+    # Main optimization loop
+    for epoch in pbar:
+
+        with torch.no_grad():
+            ensemble_loss.set_ground_truth(target_crop(image_tgt))
+
+        # Forward pass
+        # [修改点] 将矩阵掩码和生成的扰动相乘
+        adv_image = image_org + (delta * mask)
+        adv_features = ensemble_extractor(adv_image)
+
+        # Calculate metrics
+        metrics = {
+            'max_delta': torch.max(torch.abs(delta * mask)).item(),
+            'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+        }
+
+        # Calculate loss based on configuration
+        global_sim = ensemble_loss(adv_features)
+        metrics['global_similarity'] = global_sim.item()
+
+        if cfg.model.use_source_crop:
+            # If using source crop, calculate additional local similarity
+            local_cropped = source_crop(adv_image)
+            local_features = ensemble_extractor(local_cropped)
+            local_sim = ensemble_loss(local_features)
+            loss = -local_sim # since we want to maximize the loss
+            metrics['local_similarity'] = local_sim.item()
+        else:
+            # Otherwise use global similarity as loss
+            loss = -global_sim
+
+        log_metrics(pbar, metrics, img_index, epoch)
+
+        optimizer.zero_grad()
+        loss.backward()
+
+        # PGD update
+        optimizer.step()
+        delta.data = torch.clamp(
+            delta,
+            min=-cfg.optim.epsilon,
+            max=cfg.optim.epsilon,
+        )
+        # [新增点] 强制约束 delta
+        delta.data = delta.data * mask
+
+    # Create final adversarial image
+    # [修改点] 最终输出约束
+    adv_image = image_org + (delta * mask)
+    adv_image = torch.clamp(adv_image / 255.0, 0.0, 1.0)
+
+    # Log final perturbation metrics
+    final_metrics = {
+        'max_delta': torch.max(torch.abs(delta * mask)).item(),
+        'mean_delta': torch.mean(torch.abs(delta * mask)).item(),
+    }
+    log_metrics(pbar, final_metrics, img_index)
+
+    return adv_image
+
+
+if __name__ == '__main__':
+    main()
+```
+### 修改镜像并运行
+```python
+export HF_ENDPOINT=https://hf-mirror.com
+python adversarial_test.py
+```
+### 使用与原文相同的模型进行攻击效果测试
+```python
+python blackbox_text_generation.py -m blackbox.model_name=gpt4o
+python gpt_evaluate.py -m blackbox.model_name=gpt4o
+python keyword_matching_gpt.py -m blackbox.model_name=gpt4o
+```。">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-ji-yu-re-li-tu-jin-xing-zhen-dui-xing-de-rao-dong.html">
+<meta property="og:image" content="https://avatars.githubusercontent.com/u/135682176?v=4&size=64">
+<title>大模型对抗攻击之基于热力图进行针对性的扰动</title>
+<link href="//unpkg.com/@wooorm/starry-night@2.1.1/style/both.css" rel="stylesheet" />
+
+
+</head>
+<style>
+body{box-sizing: border-box;min-width: 200px;max-width: 900px;margin: 20px auto;padding: 45px;font-size: 16px;font-family: sans-serif;line-height: 1.25;}
+#header{display:flex;padding-bottom:8px;border-bottom: 1px solid var(--borderColor-muted, var(--color-border-muted));margin-bottom: 16px;}
+#footer {margin-top:64px; text-align: center;font-size: small;}
+
+</style>
+
+<style>
+.postTitle{margin: auto 0;font-size:40px;font-weight:bold;}
+.title-right{display:flex;margin:auto 0 0 auto;}
+.title-right .circle{padding: 14px 16px;margin-right:8px;}
+#postBody{border-bottom: 1px solid var(--color-border-default);padding-bottom:36px;}
+#postBody hr{height:2px;}
+#cmButton{height:48px;margin-top:48px;}
+#comments{margin-top:64px;}
+.g-emoji{font-size:24px;}
+@media (max-width: 600px) {
+    body {padding: 8px;}
+    .postTitle{font-size:24px;}
+}
+.copy-feedback {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 50px;
+    color: var(--color-fg-on-emphasis);
+    background-color: var(--color-fg-muted);
+    border-radius: 3px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+</style>
+
+
+
+
+<body>
+    <div id="header">
+<h1 class="postTitle">大模型对抗攻击之基于热力图进行针对性的扰动</h1>
+<div class="title-right">
+    <a href="https://KEVINN6.github.io" id="buttonHome" class="btn btn-invisible circle" title="首页">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathHome" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+    <a href="https://github.com/KEVINN6/KEVINN6.github.io/issues/4" target="_blank" class="btn btn-invisible circle" title="Issue">
+        <svg class="octicon" width="16" height="16">
+            <path id="pathIssue" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+    
+
+    <a class="btn btn-invisible circle" onclick="modeSwitch();" title="切换主题">
+        <svg class="octicon" width="16" height="16" >
+            <path id="themeSwitch" fill-rule="evenodd"></path>
+        </svg>
+    </a>
+
+</div>
+</div>
+    <div id="content">
+<div class="markdown-body" id="postBody"><h1>大模型对抗攻击之基于热力图进行针对性的扰动</h1>
+<p><a target="_blank" rel="noopener noreferrer" href="https://github.com/user-attachments/assets/022af6fb-fdfa-4774-9700-a48ef3a781ae"><img width="1588" height="485" alt="Image" src="https://github.com/user-attachments/assets/022af6fb-fdfa-4774-9700-a48ef3a781ae" style="max-width: 100%; height: auto; max-height: 485px;; aspect-ratio: 1588 / 485; background-color: var(--bgColor-muted); border-radius: 6px; display: block" class="js-gh-image-fallback"></a></p>
+将扰动与生成的热力图对应的矩阵掩码相乘再与原图进行叠加
+$adv\_image = image\_org + \delta \times mask$ 
+<h3>完整代码如下：</h3>
+<div class="highlight highlight-source-python"><pre class="notranslate"><span class="pl-k">import</span> <span class="pl-s1">os</span>
+<span class="pl-k">import</span> <span class="pl-s1">json</span>
+<span class="pl-k">import</span> <span class="pl-s1">hashlib</span>
+<span class="pl-k">import</span> <span class="pl-s1">random</span>
+<span class="pl-k">import</span> <span class="pl-s1">torchvision</span>.<span class="pl-s1">transforms</span> <span class="pl-k">as</span> <span class="pl-s1">transforms</span>
+<span class="pl-k">import</span> <span class="pl-s1">numpy</span> <span class="pl-k">as</span> <span class="pl-s1">np</span>
+<span class="pl-k">import</span> <span class="pl-s1">torch</span>
+<span class="pl-k">import</span> <span class="pl-s1">torchvision</span>
+<span class="pl-k">from</span> <span class="pl-c1">PIL</span> <span class="pl-k">import</span> <span class="pl-v">Image</span>, <span class="pl-v">ImageFilter</span>  <span class="pl-c"># [新增] 引入 ImageFilter 用于掩码平滑</span>
+<span class="pl-k">import</span> <span class="pl-s1">hydra</span>
+<span class="pl-k">from</span> <span class="pl-s1">omegaconf</span> <span class="pl-k">import</span> <span class="pl-v">DictConfig</span>
+<span class="pl-k">import</span> <span class="pl-s1">os</span>
+<span class="pl-k">from</span> <span class="pl-s1">config_schema</span> <span class="pl-k">import</span> <span class="pl-v">MainConfig</span>
+<span class="pl-k">from</span> <span class="pl-s1">functools</span> <span class="pl-k">import</span> <span class="pl-s1">partial</span>
+<span class="pl-k">from</span> <span class="pl-s1">typing</span> <span class="pl-k">import</span> <span class="pl-v">List</span>, <span class="pl-v">Dict</span>, <span class="pl-v">Optional</span>
+<span class="pl-k">from</span> <span class="pl-s1">torch</span> <span class="pl-k">import</span> <span class="pl-s1">nn</span>
+<span class="pl-k">from</span> <span class="pl-s1">pytorch_lightning</span> <span class="pl-k">import</span> <span class="pl-s1">seed_everything</span>
+<span class="pl-k">import</span> <span class="pl-s1">wandb</span>
+<span class="pl-k">from</span> <span class="pl-s1">omegaconf</span> <span class="pl-k">import</span> <span class="pl-v">OmegaConf</span>
+<span class="pl-k">from</span> <span class="pl-s1">tqdm</span> <span class="pl-k">import</span> <span class="pl-s1">tqdm</span>
+<span class="pl-k">import</span> <span class="pl-s1">time</span>
+
+<span class="pl-k">from</span> <span class="pl-s1">rembg</span> <span class="pl-k">import</span> <span class="pl-s1">remove</span>  <span class="pl-c"># [新增] 引入 rembg 进行主体提取</span>
+
+<span class="pl-k">from</span> <span class="pl-s1">surrogates</span> <span class="pl-k">import</span> (
+    <span class="pl-v">ClipB16FeatureExtractor</span>,
+    <span class="pl-v">ClipL336FeatureExtractor</span>,
+    <span class="pl-v">ClipB32FeatureExtractor</span>,
+    <span class="pl-v">ClipLaionFeatureExtractor</span>,
+    <span class="pl-v">EnsembleFeatureLoss</span>,
+    <span class="pl-v">EnsembleFeatureExtractor</span>,
+)
+
+<span class="pl-k">from</span> <span class="pl-s1">utils</span> <span class="pl-k">import</span> <span class="pl-s1">hash_training_config</span>, <span class="pl-s1">setup_wandb</span>, <span class="pl-s1">ensure_dir</span>
+
+<span class="pl-c"># Mapping from backbone names to model classes</span>
+<span class="pl-c1">BACKBONE_MAP</span>: <span class="pl-v">Dict</span>[<span class="pl-smi">str</span>, <span class="pl-smi">type</span>] <span class="pl-c1">=</span> {
+    <span class="pl-s">"L336"</span>: <span class="pl-v">ClipL336FeatureExtractor</span>,
+    <span class="pl-s">"B16"</span>: <span class="pl-v">ClipB16FeatureExtractor</span>,
+    <span class="pl-s">"B32"</span>: <span class="pl-v">ClipB32FeatureExtractor</span>,
+    <span class="pl-s">"Laion"</span>: <span class="pl-v">ClipLaionFeatureExtractor</span>,
+}
+
+
+<span class="pl-k">def</span> <span class="pl-en">get_models</span>(<span class="pl-s1">cfg</span>: <span class="pl-smi">MainConfig</span>):
+    <span class="pl-s">"""Get models based on configuration.</span>
+<span class="pl-s"></span>
+<span class="pl-s">    Args:</span>
+<span class="pl-s">        cfg: Configuration object containing model settings</span>
+<span class="pl-s"></span>
+<span class="pl-s">    Returns:</span>
+<span class="pl-s">        Tuple of (feature_extractor, list of models)</span>
+<span class="pl-s"></span>
+<span class="pl-s">    Raises:</span>
+<span class="pl-s">        ValueError: If ensemble=False but multiple backbones specified</span>
+<span class="pl-s">    """</span>
+    <span class="pl-k">if</span> <span class="pl-c1">not</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">ensemble</span> <span class="pl-c1">and</span> <span class="pl-en">len</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">backbone</span>) <span class="pl-c1">&gt;</span> <span class="pl-c1">1</span>:
+        <span class="pl-k">raise</span> <span class="pl-en">ValueError</span>(<span class="pl-s">"When ensemble=False, only one backbone can be specified"</span>)
+
+    <span class="pl-s1">models</span> <span class="pl-c1">=</span> []
+    <span class="pl-k">for</span> <span class="pl-s1">backbone_name</span> <span class="pl-c1">in</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">backbone</span>:
+        <span class="pl-k">if</span> <span class="pl-s1">backbone_name</span> <span class="pl-c1"><span class="pl-c1">not</span> <span class="pl-c1">in</span></span> <span class="pl-c1">BACKBONE_MAP</span>:
+            <span class="pl-k">raise</span> <span class="pl-en">ValueError</span>(
+                <span class="pl-s">f"Unknown backbone: <span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">backbone_name</span><span class="pl-kos">}</span></span>. Valid options are: <span class="pl-s1"><span class="pl-kos">{</span><span class="pl-en">list</span>(<span class="pl-c1">BACKBONE_MAP</span>.<span class="pl-c1">keys</span>())<span class="pl-kos">}</span></span>"</span>
+            )
+        <span class="pl-s1">model_class</span> <span class="pl-c1">=</span> <span class="pl-c1">BACKBONE_MAP</span>[<span class="pl-s1">backbone_name</span>]
+        <span class="pl-s1">model</span> <span class="pl-c1">=</span> <span class="pl-en">model_class</span>().<span class="pl-c1">eval</span>().<span class="pl-c1">to</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">device</span>).<span class="pl-c1">requires_grad_</span>(<span class="pl-c1">False</span>)
+        <span class="pl-s1">models</span>.<span class="pl-c1">append</span>(<span class="pl-s1">model</span>)
+
+    <span class="pl-k">if</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">ensemble</span>:
+        <span class="pl-s1">ensemble_extractor</span> <span class="pl-c1">=</span> <span class="pl-en">EnsembleFeatureExtractor</span>(<span class="pl-s1">models</span>)
+    <span class="pl-k">else</span>:
+        <span class="pl-s1">ensemble_extractor</span> <span class="pl-c1">=</span> <span class="pl-s1">models</span>[<span class="pl-c1">0</span>]  <span class="pl-c"># Use single model directly</span>
+
+    <span class="pl-k">return</span> <span class="pl-s1">ensemble_extractor</span>, <span class="pl-s1">models</span>
+
+
+<span class="pl-k">def</span> <span class="pl-en">get_ensemble_loss</span>(<span class="pl-s1">cfg</span>: <span class="pl-smi">MainConfig</span>, <span class="pl-s1">models</span>: <span class="pl-v">List</span>[<span class="pl-s1">nn</span>.<span class="pl-c1">Module</span>]):
+    <span class="pl-s1">ensemble_loss</span> <span class="pl-c1">=</span> <span class="pl-en">EnsembleFeatureLoss</span>(<span class="pl-s1">models</span>)
+    <span class="pl-k">return</span> <span class="pl-s1">ensemble_loss</span>
+
+
+<span class="pl-k">def</span> <span class="pl-en">set_environment</span>(<span class="pl-s1">seed</span><span class="pl-c1">=</span><span class="pl-c1">2023</span>):
+    <span class="pl-s1">random</span>.<span class="pl-c1">seed</span>(<span class="pl-s1">seed</span>)
+    <span class="pl-s1">os</span>.<span class="pl-c1">environ</span>[<span class="pl-s">"PYTHONHASHSEED"</span>] <span class="pl-c1">=</span> <span class="pl-en">str</span>(<span class="pl-s1">seed</span>)
+    <span class="pl-s1">np</span>.<span class="pl-c1">random</span>.<span class="pl-c1">seed</span>(<span class="pl-s1">seed</span>)
+    <span class="pl-s1">torch</span>.<span class="pl-c1">manual_seed</span>(<span class="pl-s1">seed</span>)
+    <span class="pl-s1">torch</span>.<span class="pl-c1">cuda</span>.<span class="pl-c1">manual_seed</span>(<span class="pl-s1">seed</span>)
+    <span class="pl-s1">torch</span>.<span class="pl-c1">backends</span>.<span class="pl-c1">cudnn</span>.<span class="pl-c1">deterministic</span> <span class="pl-c1">=</span> <span class="pl-c1">True</span>
+    <span class="pl-s1">torch</span>.<span class="pl-c1">backends</span>.<span class="pl-c1">cudnn</span>.<span class="pl-c1">benchmark</span> <span class="pl-c1">=</span> <span class="pl-c1">False</span>
+
+
+<span class="pl-c"># Transform PIL.Image to PyTorch Tensor</span>
+<span class="pl-k">def</span> <span class="pl-en">to_tensor</span>(<span class="pl-s1">pic</span>):
+    <span class="pl-s1">mode_to_nptype</span> <span class="pl-c1">=</span> {<span class="pl-s">"I"</span>: <span class="pl-s1">np</span>.<span class="pl-c1">int32</span>, <span class="pl-s">"I;16"</span>: <span class="pl-s1">np</span>.<span class="pl-c1">int16</span>, <span class="pl-s">"F"</span>: <span class="pl-s1">np</span>.<span class="pl-c1">float32</span>}
+    <span class="pl-s1">img</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">from_numpy</span>(
+        <span class="pl-s1">np</span>.<span class="pl-c1">array</span>(<span class="pl-s1">pic</span>, <span class="pl-s1">mode_to_nptype</span>.<span class="pl-c1">get</span>(<span class="pl-s1">pic</span>.<span class="pl-c1">mode</span>, <span class="pl-s1">np</span>.<span class="pl-c1">uint8</span>), <span class="pl-s1">copy</span><span class="pl-c1">=</span><span class="pl-c1">True</span>)
+    )
+    <span class="pl-s1">img</span> <span class="pl-c1">=</span> <span class="pl-s1">img</span>.<span class="pl-c1">view</span>(<span class="pl-s1">pic</span>.<span class="pl-c1">size</span>[<span class="pl-c1">1</span>], <span class="pl-s1">pic</span>.<span class="pl-c1">size</span>[<span class="pl-c1">0</span>], <span class="pl-en">len</span>(<span class="pl-s1">pic</span>.<span class="pl-c1">getbands</span>()))
+    <span class="pl-s1">img</span> <span class="pl-c1">=</span> <span class="pl-s1">img</span>.<span class="pl-c1">permute</span>((<span class="pl-c1">2</span>, <span class="pl-c1">0</span>, <span class="pl-c1">1</span>)).<span class="pl-c1">contiguous</span>()
+    <span class="pl-k">return</span> <span class="pl-s1">img</span>.<span class="pl-c1">to</span>(<span class="pl-s1">dtype</span><span class="pl-c1">=</span><span class="pl-s1">torch</span>.<span class="pl-c1">get_default_dtype</span>())
+
+
+<span class="pl-c"># Dataset with image paths</span>
+<span class="pl-k">class</span> <span class="pl-v">ImageFolderWithPaths</span>(<span class="pl-s1">torchvision</span>.<span class="pl-c1">datasets</span>.<span class="pl-c1">ImageFolder</span>):
+    <span class="pl-k">def</span> <span class="pl-en">__getitem__</span>(<span class="pl-s1">self</span>, <span class="pl-s1">index</span>):
+        <span class="pl-s1">original_tuple</span> <span class="pl-c1">=</span> <span class="pl-en">super</span>().<span class="pl-c1">__getitem__</span>(<span class="pl-s1">index</span>)
+        <span class="pl-s1">path</span>, <span class="pl-s1">_</span> <span class="pl-c1">=</span> <span class="pl-s1">self</span>.<span class="pl-c1">samples</span>[<span class="pl-s1">index</span>]
+        <span class="pl-k">return</span> <span class="pl-s1">original_tuple</span> <span class="pl-c1">+</span> (<span class="pl-s1">path</span>,)
+
+
+<span class="pl-c"># ================= [新增] 动态生成热力图掩码函数 =================</span>
+<span class="pl-k">def</span> <span class="pl-en">generate_batch_masks_on_the_fly</span>(<span class="pl-s1">path_list</span>, <span class="pl-s1">cfg</span>, <span class="pl-s1">device</span>):
+    <span class="pl-s1">masks</span> <span class="pl-c1">=</span> []
+    <span class="pl-k">for</span> <span class="pl-s1">p</span> <span class="pl-c1">in</span> <span class="pl-s1">path_list</span>:
+        <span class="pl-s1">raw_image</span> <span class="pl-c1">=</span> <span class="pl-v">Image</span>.<span class="pl-c1">open</span>(<span class="pl-s1">p</span>).<span class="pl-c1">convert</span>(<span class="pl-s">"RGB"</span>)
+        <span class="pl-s1">mask_image</span> <span class="pl-c1">=</span> <span class="pl-en">remove</span>(<span class="pl-s1">raw_image</span>, <span class="pl-s1">only_mask</span><span class="pl-c1">=</span><span class="pl-c1">True</span>)
+        <span class="pl-s1">blurred_mask</span> <span class="pl-c1">=</span> <span class="pl-s1">mask_image</span>.<span class="pl-c1">filter</span>(<span class="pl-v">ImageFilter</span>.<span class="pl-c1">GaussianBlur</span>(<span class="pl-s1">radius</span><span class="pl-c1">=</span><span class="pl-c1">10</span>))
+        <span class="pl-s1">mask_tensor</span> <span class="pl-c1">=</span> <span class="pl-s1">transforms</span>.<span class="pl-c1">ToTensor</span>()(<span class="pl-s1">blurred_mask</span>.<span class="pl-c1">convert</span>(<span class="pl-s">"L"</span>)).<span class="pl-c1">to</span>(<span class="pl-s1">device</span>)
+        <span class="pl-s1">mask_tensor</span> <span class="pl-c1">=</span> <span class="pl-s1">transforms</span>.<span class="pl-c1">Resize</span>((<span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">input_res</span>, <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">input_res</span>))(<span class="pl-s1">mask_tensor</span>)
+        <span class="pl-s1">masks</span>.<span class="pl-c1">append</span>(<span class="pl-s1">mask_tensor</span>)
+    <span class="pl-k">return</span> <span class="pl-s1">torch</span>.<span class="pl-c1">stack</span>(<span class="pl-s1">masks</span>)
+<span class="pl-c"># ================================================================</span>
+
+
+<span class="pl-en">@<span class="pl-s1">hydra</span>.<span class="pl-c1">main</span>(<span class="pl-s1">version_base</span><span class="pl-c1">=</span><span class="pl-c1">None</span>, <span class="pl-s1">config_path</span><span class="pl-c1">=</span><span class="pl-s">"config"</span>, <span class="pl-s1">config_name</span><span class="pl-c1">=</span><span class="pl-s">"ensemble_3models"</span>)</span>
+<span class="pl-k">def</span> <span class="pl-en">main</span>(<span class="pl-s1">cfg</span>: <span class="pl-smi">MainConfig</span>):
+    <span class="pl-en">set_environment</span>()
+
+    <span class="pl-c"># Initialize wandb using shared utility</span>
+    <span class="pl-en">setup_wandb</span>(<span class="pl-s1">cfg</span>, <span class="pl-s1">tags</span><span class="pl-c1">=</span>[<span class="pl-s">"image_generation"</span>])
+    <span class="pl-c"># Define metrics relationship for logging multiple images</span>
+    <span class="pl-s1">wandb</span>.<span class="pl-c1">define_metric</span>(<span class="pl-s">"epoch"</span>)
+    <span class="pl-s1">wandb</span>.<span class="pl-c1">define_metric</span>(<span class="pl-s">"*"</span>, <span class="pl-s1">step_metric</span><span class="pl-c1">=</span><span class="pl-s">"epoch"</span>)
+
+    <span class="pl-s1">ensemble_extractor</span>, <span class="pl-s1">models</span> <span class="pl-c1">=</span> <span class="pl-en">get_models</span>(<span class="pl-s1">cfg</span>)
+    <span class="pl-s1">ensemble_loss</span> <span class="pl-c1">=</span> <span class="pl-en">get_ensemble_loss</span>(<span class="pl-s1">cfg</span>, <span class="pl-s1">models</span>)
+
+    <span class="pl-s1">transform_fn</span> <span class="pl-c1">=</span> <span class="pl-s1">transforms</span>.<span class="pl-c1">Compose</span>(
+        [
+            <span class="pl-s1">transforms</span>.<span class="pl-c1">Resize</span>(
+                <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">input_res</span>,
+                <span class="pl-s1">interpolation</span><span class="pl-c1">=</span><span class="pl-s1">torchvision</span>.<span class="pl-c1">transforms</span>.<span class="pl-c1">InterpolationMode</span>.<span class="pl-c1">BICUBIC</span>,
+            ),
+            <span class="pl-s1">transforms</span>.<span class="pl-c1">CenterCrop</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">input_res</span>),
+            <span class="pl-s1">transforms</span>.<span class="pl-c1">Lambda</span>(<span class="pl-k">lambda</span> <span class="pl-s1">img</span>: <span class="pl-s1">img</span>.<span class="pl-c1">convert</span>(<span class="pl-s">"RGB"</span>)),
+            <span class="pl-s1">transforms</span>.<span class="pl-c1">Lambda</span>(<span class="pl-k">lambda</span> <span class="pl-s1">img</span>: <span class="pl-en">to_tensor</span>(<span class="pl-s1">img</span>)),
+        ]
+    )
+
+    <span class="pl-s1">clean_data</span> <span class="pl-c1">=</span> <span class="pl-en">ImageFolderWithPaths</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">cle_data_path</span>, <span class="pl-s1">transform</span><span class="pl-c1">=</span><span class="pl-s1">transform_fn</span>)
+    <span class="pl-s1">target_data</span> <span class="pl-c1">=</span> <span class="pl-en">ImageFolderWithPaths</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">tgt_data_path</span>, <span class="pl-s1">transform</span><span class="pl-c1">=</span><span class="pl-s1">transform_fn</span>)
+
+    <span class="pl-s1">data_loader_imagenet</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">utils</span>.<span class="pl-c1">data</span>.<span class="pl-c1">DataLoader</span>(
+        <span class="pl-s1">clean_data</span>, <span class="pl-s1">batch_size</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">batch_size</span>, <span class="pl-s1">shuffle</span><span class="pl-c1">=</span><span class="pl-c1">False</span>
+    )
+    <span class="pl-s1">data_loader_target</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">utils</span>.<span class="pl-c1">data</span>.<span class="pl-c1">DataLoader</span>(
+        <span class="pl-s1">target_data</span>, <span class="pl-s1">batch_size</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">batch_size</span>, <span class="pl-s1">shuffle</span><span class="pl-c1">=</span><span class="pl-c1">False</span>
+    )
+
+    <span class="pl-en">print</span>(<span class="pl-s">"Using source crop:"</span>, <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">use_source_crop</span>)
+    <span class="pl-en">print</span>(<span class="pl-s">"Using target crop:"</span>, <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">use_target_crop</span>)
+
+    <span class="pl-s1">source_crop</span> <span class="pl-c1">=</span> (
+        <span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">input_res</span>, <span class="pl-s1">scale</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">crop_scale</span>)
+        <span class="pl-k">if</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">use_source_crop</span>
+        <span class="pl-k">else</span> <span class="pl-s1">torch</span>.<span class="pl-c1">nn</span>.<span class="pl-c1">Identity</span>()
+    )
+    <span class="pl-s1">target_crop</span> <span class="pl-c1">=</span> (
+        <span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">input_res</span>, <span class="pl-s1">scale</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">crop_scale</span>)
+        <span class="pl-k">if</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">use_target_crop</span>
+        <span class="pl-k">else</span> <span class="pl-s1">torch</span>.<span class="pl-c1">nn</span>.<span class="pl-c1">Identity</span>()
+    )
+
+    <span class="pl-k">for</span> <span class="pl-s1">i</span>, ((<span class="pl-s1">image_org</span>, <span class="pl-s1">_</span>, <span class="pl-s1">path_org</span>), (<span class="pl-s1">image_tgt</span>, <span class="pl-s1">_</span>, <span class="pl-s1">path_tgt</span>)) <span class="pl-c1">in</span> <span class="pl-en">enumerate</span>(
+        <span class="pl-en">zip</span>(<span class="pl-s1">data_loader_imagenet</span>, <span class="pl-s1">data_loader_target</span>)
+    ):
+        <span class="pl-k">if</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">batch_size</span> <span class="pl-c1">*</span> (<span class="pl-s1">i</span> <span class="pl-c1">+</span> <span class="pl-c1">1</span>) <span class="pl-c1">&gt;</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">num_samples</span>:
+            <span class="pl-k">break</span>
+
+        <span class="pl-en">print</span>(<span class="pl-s">f"<span class="pl-cce">\n</span>Processing image <span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">i</span><span class="pl-c1">+</span><span class="pl-c1">1</span><span class="pl-kos">}</span></span>/<span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">num_samples</span><span class="pl-c1">//</span><span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">batch_size</span><span class="pl-kos">}</span></span>"</span>)
+
+        <span class="pl-c"># [新增] 动态生成矩阵掩码</span>
+        <span class="pl-s1">mask</span> <span class="pl-c1">=</span> <span class="pl-en">generate_batch_masks_on_the_fly</span>(<span class="pl-s1">path_org</span>, <span class="pl-s1">cfg</span>, <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">device</span>)
+
+        <span class="pl-en">attack_imgpair</span>(
+            <span class="pl-s1">cfg</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>,
+            <span class="pl-s1">ensemble_extractor</span><span class="pl-c1">=</span><span class="pl-s1">ensemble_extractor</span>,
+            <span class="pl-s1">ensemble_loss</span><span class="pl-c1">=</span><span class="pl-s1">ensemble_loss</span>,
+            <span class="pl-s1">source_crop</span><span class="pl-c1">=</span><span class="pl-s1">source_crop</span>,
+            <span class="pl-s1">img_index</span><span class="pl-c1">=</span><span class="pl-s1">i</span>,
+            <span class="pl-s1">image_org</span><span class="pl-c1">=</span><span class="pl-s1">image_org</span>,
+            <span class="pl-s1">path_org</span><span class="pl-c1">=</span><span class="pl-s1">path_org</span>,
+            <span class="pl-s1">image_tgt</span><span class="pl-c1">=</span><span class="pl-s1">image_tgt</span>,
+            <span class="pl-s1">target_crop</span><span class="pl-c1">=</span><span class="pl-s1">target_crop</span>,
+            <span class="pl-s1">mask</span><span class="pl-c1">=</span><span class="pl-s1">mask</span>  <span class="pl-c"># [新增] 传入 mask</span>
+        )
+
+    <span class="pl-s1">wandb</span>.<span class="pl-c1">finish</span>()
+
+
+<span class="pl-k">def</span> <span class="pl-en">attack_imgpair</span>(
+    <span class="pl-s1">cfg</span>: <span class="pl-smi">MainConfig</span>,
+    <span class="pl-s1">ensemble_extractor</span>: <span class="pl-s1">nn</span>.<span class="pl-c1">Module</span>,
+    <span class="pl-s1">ensemble_loss</span>: <span class="pl-s1">nn</span>.<span class="pl-c1">Module</span>,
+    <span class="pl-s1">source_crop</span>: <span class="pl-v">Optional</span>[<span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>],
+    <span class="pl-s1">target_crop</span>: <span class="pl-v">Optional</span>[<span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>],
+    <span class="pl-s1">img_index</span>: <span class="pl-smi">int</span>,
+    <span class="pl-s1">image_org</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>,
+    <span class="pl-s1">path_org</span>: <span class="pl-v">List</span>[<span class="pl-smi">str</span>],
+    <span class="pl-s1">image_tgt</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>,
+    <span class="pl-s1">mask</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>  <span class="pl-c"># [新增] 接收 mask</span>
+):
+    <span class="pl-s1">image_org</span>, <span class="pl-s1">image_tgt</span> <span class="pl-c1">=</span> <span class="pl-s1">image_org</span>.<span class="pl-c1">to</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">device</span>), <span class="pl-s1">image_tgt</span>.<span class="pl-c1">to</span>(
+        <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">device</span>
+    )
+    <span class="pl-s1">attack_type</span> <span class="pl-c1">=</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">attack</span>
+    <span class="pl-s1">attack_fn</span> <span class="pl-c1">=</span> {
+        <span class="pl-s">"fgsm"</span>: <span class="pl-s1">fgsm_attack</span>,
+        <span class="pl-s">"mifgsm"</span>: <span class="pl-s1">mifgsm_attack</span>,
+        <span class="pl-s">"pgd"</span>: <span class="pl-s1">pgd_attack</span>,
+    }[<span class="pl-s1">attack_type</span>]
+    <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-en">attack_fn</span>(
+        <span class="pl-s1">cfg</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>,
+        <span class="pl-s1">ensemble_extractor</span><span class="pl-c1">=</span><span class="pl-s1">ensemble_extractor</span>,
+        <span class="pl-s1">ensemble_loss</span><span class="pl-c1">=</span><span class="pl-s1">ensemble_loss</span>,
+        <span class="pl-s1">source_crop</span><span class="pl-c1">=</span><span class="pl-s1">source_crop</span>,
+        <span class="pl-s1">target_crop</span><span class="pl-c1">=</span><span class="pl-s1">target_crop</span>,
+        <span class="pl-s1">img_index</span><span class="pl-c1">=</span><span class="pl-s1">img_index</span>,
+        <span class="pl-s1">image_org</span><span class="pl-c1">=</span><span class="pl-s1">image_org</span>,
+        <span class="pl-s1">image_tgt</span><span class="pl-c1">=</span><span class="pl-s1">image_tgt</span>,
+        <span class="pl-s1">mask</span><span class="pl-c1">=</span><span class="pl-s1">mask</span>  <span class="pl-c"># [新增] 传入 mask 给具体攻击函数</span>
+    )
+
+    <span class="pl-c"># Get config hash for output directory</span>
+    <span class="pl-s1">config_hash</span> <span class="pl-c1">=</span> <span class="pl-en">hash_training_config</span>(<span class="pl-s1">cfg</span>)
+    <span class="pl-s1">unique_hash</span> <span class="pl-c1">=</span> <span class="pl-s">f"<span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">config_hash</span><span class="pl-kos">}</span></span>_<span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">time</span>.<span class="pl-c1">strftime</span>(<span class="pl-s">'%m%d_%H%M%S'</span>)<span class="pl-kos">}</span></span>"</span>
+
+    <span class="pl-c"># Save images</span>
+    <span class="pl-k">for</span> <span class="pl-s1">path_idx</span> <span class="pl-c1">in</span> <span class="pl-en">range</span>(<span class="pl-en">len</span>(<span class="pl-s1">path_org</span>)):
+        <span class="pl-s1">folder</span>, <span class="pl-s1">name</span> <span class="pl-c1">=</span> (
+            <span class="pl-s1">path_org</span>[<span class="pl-s1">path_idx</span>].<span class="pl-c1">split</span>(<span class="pl-s">"/"</span>)[<span class="pl-c1">-</span><span class="pl-c1">2</span>],
+            <span class="pl-s1">path_org</span>[<span class="pl-s1">path_idx</span>].<span class="pl-c1">split</span>(<span class="pl-s">"/"</span>)[<span class="pl-c1">-</span><span class="pl-c1">1</span>],
+        )
+        <span class="pl-c"># Use config hash in output path</span>
+        <span class="pl-s1">folder_to_save</span> <span class="pl-c1">=</span> <span class="pl-s1">os</span>.<span class="pl-c1">path</span>.<span class="pl-c1">join</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">output</span>, <span class="pl-s">"img"</span>, <span class="pl-s1">unique_hash</span>, <span class="pl-s1">folder</span>)
+        <span class="pl-en">ensure_dir</span>(<span class="pl-s1">folder_to_save</span>)
+
+        <span class="pl-k">if</span> <span class="pl-s">"JPEG"</span> <span class="pl-c1">in</span> <span class="pl-s1">name</span>:
+            <span class="pl-s1">torchvision</span>.<span class="pl-c1">utils</span>.<span class="pl-c1">save_image</span>(
+                <span class="pl-s1">adv_image</span>[<span class="pl-s1">path_idx</span>], <span class="pl-s1">os</span>.<span class="pl-c1">path</span>.<span class="pl-c1">join</span>(<span class="pl-s1">folder_to_save</span>, <span class="pl-s1">name</span>[:<span class="pl-c1">-</span><span class="pl-c1">4</span>]) <span class="pl-c1">+</span> <span class="pl-s">"png"</span>
+            )
+        <span class="pl-k">elif</span> <span class="pl-s">"png"</span> <span class="pl-c1">in</span> <span class="pl-s1">name</span>:
+            <span class="pl-s1">torchvision</span>.<span class="pl-c1">utils</span>.<span class="pl-c1">save_image</span>(
+                <span class="pl-s1">adv_image</span>[<span class="pl-s1">path_idx</span>], <span class="pl-s1">os</span>.<span class="pl-c1">path</span>.<span class="pl-c1">join</span>(<span class="pl-s1">folder_to_save</span>, <span class="pl-s1">name</span>)
+            )
+
+
+<span class="pl-k">def</span> <span class="pl-en">log_metrics</span>(<span class="pl-s1">pbar</span>, <span class="pl-s1">metrics</span>, <span class="pl-s1">img_index</span>, <span class="pl-s1">epoch</span><span class="pl-c1">=</span><span class="pl-c1">None</span>):
+    <span class="pl-s">"""</span>
+<span class="pl-s">    Log metrics to progress bar and wandb.</span>
+<span class="pl-s"></span>
+<span class="pl-s">    Args:</span>
+<span class="pl-s">        pbar: tqdm progress bar to update</span>
+<span class="pl-s">        metrics: Dictionary of metrics to log</span>
+<span class="pl-s">        img_index: Index of the image (for wandb logging)</span>
+<span class="pl-s">        epoch: Optional epoch number for logging</span>
+<span class="pl-s">    """</span>
+    <span class="pl-c"># Format metrics for progress bar</span>
+    <span class="pl-s1">pbar_metrics</span> <span class="pl-c1">=</span> {
+        <span class="pl-s1">k</span>: <span class="pl-s">f"<span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">v</span>:.5f<span class="pl-kos">}</span></span>"</span> <span class="pl-k">if</span> <span class="pl-s">"sim"</span> <span class="pl-c1">in</span> <span class="pl-s1">k</span> <span class="pl-k">else</span> <span class="pl-s">f"<span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">v</span>:.3f<span class="pl-kos">}</span></span>"</span> <span class="pl-k">for</span> <span class="pl-s1">k</span>, <span class="pl-s1">v</span> <span class="pl-c1">in</span> <span class="pl-s1">metrics</span>.<span class="pl-c1">items</span>()
+    }
+    <span class="pl-s1">pbar</span>.<span class="pl-c1">set_postfix</span>(<span class="pl-s1">pbar_metrics</span>)
+
+    <span class="pl-c"># Prepare wandb metrics with image index</span>
+    <span class="pl-s1">wandb_metrics</span> <span class="pl-c1">=</span> {<span class="pl-s">f"img<span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">img_index</span><span class="pl-kos">}</span></span>_<span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">k</span><span class="pl-kos">}</span></span>"</span>: <span class="pl-s1">v</span> <span class="pl-k">for</span> <span class="pl-s1">k</span>, <span class="pl-s1">v</span> <span class="pl-c1">in</span> <span class="pl-s1">metrics</span>.<span class="pl-c1">items</span>()}
+    <span class="pl-k">if</span> <span class="pl-s1">epoch</span> <span class="pl-c1"><span class="pl-c1">is</span> <span class="pl-c1">not</span></span> <span class="pl-c1">None</span>:
+        <span class="pl-s1">wandb_metrics</span>[<span class="pl-s">"epoch"</span>] <span class="pl-c1">=</span> <span class="pl-s1">epoch</span>
+
+    <span class="pl-c"># Log to wandb</span>
+    <span class="pl-s1">wandb</span>.<span class="pl-c1">log</span>(<span class="pl-s1">wandb_metrics</span>)
+
+
+<span class="pl-k">def</span> <span class="pl-en">fgsm_attack</span>(
+    <span class="pl-s1">cfg</span>: <span class="pl-smi">MainConfig</span>,
+    <span class="pl-s1">ensemble_extractor</span>: <span class="pl-s1">nn</span>.<span class="pl-c1">Module</span>,
+    <span class="pl-s1">ensemble_loss</span>: <span class="pl-s1">nn</span>.<span class="pl-c1">Module</span>,
+    <span class="pl-s1">source_crop</span>: <span class="pl-v">Optional</span>[<span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>],
+    <span class="pl-s1">target_crop</span>: <span class="pl-v">Optional</span>[<span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>],
+    <span class="pl-s1">img_index</span>: <span class="pl-smi">int</span>,
+    <span class="pl-s1">image_org</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>,
+    <span class="pl-s1">image_tgt</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>,
+    <span class="pl-s1">mask</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>  <span class="pl-c"># [新增] 接收 mask</span>
+):
+    <span class="pl-s">"""</span>
+<span class="pl-s">       Perform FGSM attack on the image to generate adversarial examples.</span>
+<span class="pl-s"></span>
+<span class="pl-s">       Args:</span>
+<span class="pl-s">           cfg: Configuration parameters</span>
+<span class="pl-s">           ensemble_extractor: Ensemble feature extractor model</span>
+<span class="pl-s">           ensemble_loss: Ensemble loss function</span>
+<span class="pl-s">           source_crop: Optional transform for cropping source images</span>
+<span class="pl-s">           target_crop: Optional transform for cropping target images</span>
+<span class="pl-s">           i: Index of the image (for logging)</span>
+<span class="pl-s">           image_org: Original source image tensor</span>
+<span class="pl-s">           image_tgt: Target image tensor to match features with</span>
+<span class="pl-s"></span>
+<span class="pl-s">       Returns:</span>
+<span class="pl-s">           torch.Tensor: Generated adversarial image</span>
+<span class="pl-s">       """</span>
+    <span class="pl-c"># Initialize perturbation</span>
+    <span class="pl-s1">delta</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">zeros_like</span>(<span class="pl-s1">image_org</span>, <span class="pl-s1">requires_grad</span><span class="pl-c1">=</span><span class="pl-c1">True</span>)
+
+    <span class="pl-c"># Progress bar for optimization</span>
+    <span class="pl-s1">pbar</span> <span class="pl-c1">=</span> <span class="pl-en">tqdm</span>(<span class="pl-en">range</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">steps</span>), <span class="pl-s1">desc</span><span class="pl-c1">=</span><span class="pl-s">f"Attack progress"</span>)
+
+    <span class="pl-c"># Main optimization loop</span>
+    <span class="pl-k">for</span> <span class="pl-s1">epoch</span> <span class="pl-c1">in</span> <span class="pl-s1">pbar</span>:
+
+        <span class="pl-k">with</span> <span class="pl-s1">torch</span>.<span class="pl-c1">no_grad</span>():
+            <span class="pl-s1">ensemble_loss</span>.<span class="pl-c1">set_ground_truth</span>(<span class="pl-en">target_crop</span>(<span class="pl-s1">image_tgt</span>))
+
+        <span class="pl-c"># Forward pass</span>
+        <span class="pl-c"># [修改点] 将矩阵掩码和生成的扰动相乘，使得只有 mask 区域的特征被抽取用于计算 similarity</span>
+        <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-s1">image_org</span> <span class="pl-c1">+</span> (<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)
+        <span class="pl-s1">adv_features</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_extractor</span>(<span class="pl-s1">adv_image</span>)
+
+        <span class="pl-c"># Calculate metrics (监控实际生效的扰动量)</span>
+        <span class="pl-s1">metrics</span> <span class="pl-c1">=</span> {
+            <span class="pl-s">"max_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">max</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+            <span class="pl-s">"mean_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">mean</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+        }
+
+        <span class="pl-c"># Calculate loss based on configuration</span>
+        <span class="pl-s1">global_sim</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_loss</span>(<span class="pl-s1">adv_features</span>)
+        <span class="pl-s1">metrics</span>[<span class="pl-s">"global_similarity"</span>] <span class="pl-c1">=</span> <span class="pl-s1">global_sim</span>.<span class="pl-c1">item</span>()
+
+        <span class="pl-k">if</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">use_source_crop</span>:
+            <span class="pl-c"># If using source crop, calculate additional local similarity</span>
+            <span class="pl-s1">local_cropped</span> <span class="pl-c1">=</span> <span class="pl-en">source_crop</span>(<span class="pl-s1">adv_image</span>)
+            <span class="pl-s1">local_features</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_extractor</span>(<span class="pl-s1">local_cropped</span>)
+            <span class="pl-s1">local_sim</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_loss</span>(<span class="pl-s1">local_features</span>)
+            <span class="pl-s1">loss</span> <span class="pl-c1">=</span> <span class="pl-s1">local_sim</span>
+            <span class="pl-s1">metrics</span>[<span class="pl-s">"local_similarity"</span>] <span class="pl-c1">=</span> <span class="pl-s1">local_sim</span>.<span class="pl-c1">item</span>()
+        <span class="pl-k">else</span>:
+            <span class="pl-c"># Otherwise use global similarity as loss</span>
+            <span class="pl-s1">loss</span> <span class="pl-c1">=</span> <span class="pl-s1">global_sim</span>
+
+        <span class="pl-c"># Log current metrics</span>
+        <span class="pl-en">log_metrics</span>(<span class="pl-s1">pbar</span>, <span class="pl-s1">metrics</span>, <span class="pl-s1">img_index</span>, <span class="pl-s1">epoch</span>)
+
+        <span class="pl-s1">grad</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">autograd</span>.<span class="pl-c1">grad</span>(<span class="pl-s1">loss</span>, <span class="pl-s1">delta</span>, <span class="pl-s1">create_graph</span><span class="pl-c1">=</span><span class="pl-c1">False</span>)[<span class="pl-c1">0</span>]
+
+        <span class="pl-c"># Update delta using FGSM</span>
+        <span class="pl-s1">delta</span>.<span class="pl-c1">data</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">clamp</span>(
+            <span class="pl-s1">delta</span> <span class="pl-c1">+</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">alpha</span> <span class="pl-c1">*</span> <span class="pl-s1">torch</span>.<span class="pl-c1">sign</span>(<span class="pl-s1">grad</span>),
+            <span class="pl-s1">min</span><span class="pl-c1">=</span><span class="pl-c1">-</span><span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">epsilon</span>,
+            <span class="pl-s1">max</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">epsilon</span>,
+        )
+        <span class="pl-c"># [新增点] 强制过滤背景梯度，确保 delta 在下一步依然被完全约束</span>
+        <span class="pl-s1">delta</span>.<span class="pl-c1">data</span> <span class="pl-c1">=</span> <span class="pl-s1">delta</span>.<span class="pl-c1">data</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>
+
+    <span class="pl-c"># Create final adversarial image</span>
+    <span class="pl-c"># [修改点] 最终输出也加上 mask 约束</span>
+    <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-s1">image_org</span> <span class="pl-c1">+</span> (<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)
+    <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">clamp</span>(<span class="pl-s1">adv_image</span> <span class="pl-c1">/</span> <span class="pl-c1">255.0</span>, <span class="pl-c1">0.0</span>, <span class="pl-c1">1.0</span>)
+
+    <span class="pl-c"># Log final perturbation metrics</span>
+    <span class="pl-s1">final_metrics</span> <span class="pl-c1">=</span> {
+        <span class="pl-s">"max_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">max</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+        <span class="pl-s">"mean_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">mean</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+    }
+    <span class="pl-en">log_metrics</span>(<span class="pl-s1">pbar</span>, <span class="pl-s1">final_metrics</span>, <span class="pl-s1">img_index</span>)
+
+    <span class="pl-k">return</span> <span class="pl-s1">adv_image</span>
+
+
+<span class="pl-k">def</span> <span class="pl-en">mifgsm_attack</span>(
+    <span class="pl-s1">cfg</span>: <span class="pl-smi">MainConfig</span>,
+    <span class="pl-s1">ensemble_extractor</span>: <span class="pl-s1">nn</span>.<span class="pl-c1">Module</span>,
+    <span class="pl-s1">ensemble_loss</span>: <span class="pl-s1">nn</span>.<span class="pl-c1">Module</span>,
+    <span class="pl-s1">source_crop</span>: <span class="pl-v">Optional</span>[<span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>],
+    <span class="pl-s1">target_crop</span>: <span class="pl-v">Optional</span>[<span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>],
+    <span class="pl-s1">img_index</span>: <span class="pl-smi">int</span>,
+    <span class="pl-s1">image_org</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>,
+    <span class="pl-s1">image_tgt</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>,
+    <span class="pl-s1">mask</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>  <span class="pl-c"># [新增] 接收 mask</span>
+):
+    <span class="pl-s">"""</span>
+<span class="pl-s">        Perform MI-FGSM attack on the image to generate adversarial examples.</span>
+<span class="pl-s"></span>
+<span class="pl-s">        Args:</span>
+<span class="pl-s">            cfg: Configuration parameters</span>
+<span class="pl-s">            ensemble_extractor: Ensemble feature extractor model</span>
+<span class="pl-s">            ensemble_loss: Ensemble loss function</span>
+<span class="pl-s">            source_crop: Optional transform for cropping source images</span>
+<span class="pl-s">            target_crop: Optional transform for cropping target images</span>
+<span class="pl-s">            i: Index of the image (for logging)</span>
+<span class="pl-s">            image_org: Original source image tensor</span>
+<span class="pl-s">            image_tgt: Target image tensor to match features with</span>
+<span class="pl-s"></span>
+<span class="pl-s">        Returns:</span>
+<span class="pl-s">            torch.Tensor: Generated adversarial image</span>
+<span class="pl-s">        """</span>
+    <span class="pl-c"># Initialize perturbation and momentum</span>
+    <span class="pl-s1">delta</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">zeros_like</span>(<span class="pl-s1">image_org</span>, <span class="pl-s1">requires_grad</span><span class="pl-c1">=</span><span class="pl-c1">True</span>)
+    <span class="pl-s1">momentum</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">zeros_like</span>(<span class="pl-s1">image_org</span>, <span class="pl-s1">requires_grad</span><span class="pl-c1">=</span><span class="pl-c1">False</span>)
+
+    <span class="pl-c"># Progress bar for optimization</span>
+    <span class="pl-s1">pbar</span> <span class="pl-c1">=</span> <span class="pl-en">tqdm</span>(<span class="pl-en">range</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">steps</span>), <span class="pl-s1">desc</span><span class="pl-c1">=</span><span class="pl-s">f"Attack progress"</span>)
+
+    <span class="pl-c"># Main optimization loop</span>
+    <span class="pl-k">for</span> <span class="pl-s1">epoch</span> <span class="pl-c1">in</span> <span class="pl-s1">pbar</span>:
+
+        <span class="pl-k">with</span> <span class="pl-s1">torch</span>.<span class="pl-c1">no_grad</span>():
+            <span class="pl-s1">ensemble_loss</span>.<span class="pl-c1">set_ground_truth</span>(<span class="pl-en">target_crop</span>(<span class="pl-s1">image_tgt</span>))
+
+        <span class="pl-c"># Forward pass</span>
+        <span class="pl-c"># [修改点] 将矩阵掩码和生成的扰动相乘</span>
+        <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-s1">image_org</span> <span class="pl-c1">+</span> (<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)
+        <span class="pl-s1">adv_features</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_extractor</span>(<span class="pl-s1">adv_image</span>)
+
+        <span class="pl-c"># Calculate metrics</span>
+        <span class="pl-s1">metrics</span> <span class="pl-c1">=</span> {
+            <span class="pl-s">"max_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">max</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+            <span class="pl-s">"mean_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">mean</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+        }
+
+        <span class="pl-c"># Calculate loss based on configuration</span>
+        <span class="pl-s1">global_sim</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_loss</span>(<span class="pl-s1">adv_features</span>)
+        <span class="pl-s1">metrics</span>[<span class="pl-s">"global_similarity"</span>] <span class="pl-c1">=</span> <span class="pl-s1">global_sim</span>.<span class="pl-c1">item</span>()
+
+        <span class="pl-k">if</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">use_source_crop</span>:
+            <span class="pl-c"># If using source crop, calculate additional local similarity</span>
+            <span class="pl-s1">local_cropped</span> <span class="pl-c1">=</span> <span class="pl-en">source_crop</span>(<span class="pl-s1">adv_image</span>)
+            <span class="pl-s1">local_features</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_extractor</span>(<span class="pl-s1">local_cropped</span>)
+            <span class="pl-s1">local_sim</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_loss</span>(<span class="pl-s1">local_features</span>)
+            <span class="pl-s1">loss</span> <span class="pl-c1">=</span> <span class="pl-s1">local_sim</span>
+            <span class="pl-s1">metrics</span>[<span class="pl-s">"local_similarity"</span>] <span class="pl-c1">=</span> <span class="pl-s1">local_sim</span>.<span class="pl-c1">item</span>()
+        <span class="pl-k">else</span>:
+            <span class="pl-c"># Otherwise use global similarity as loss</span>
+            <span class="pl-s1">loss</span> <span class="pl-c1">=</span> <span class="pl-s1">global_sim</span>
+
+        <span class="pl-en">log_metrics</span>(<span class="pl-s1">pbar</span>, <span class="pl-s1">metrics</span>, <span class="pl-s1">img_index</span>, <span class="pl-s1">epoch</span>)
+
+        <span class="pl-s1">grad</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">autograd</span>.<span class="pl-c1">grad</span>(<span class="pl-s1">loss</span>, <span class="pl-s1">delta</span>, <span class="pl-s1">create_graph</span><span class="pl-c1">=</span><span class="pl-c1">False</span>)[<span class="pl-c1">0</span>]
+
+        <span class="pl-c"># MI-FGSM update</span>
+        <span class="pl-s1">momentum</span> <span class="pl-c1">=</span> <span class="pl-s1">momentum</span> <span class="pl-c1">*</span> <span class="pl-c1">0.9</span> <span class="pl-c1">+</span> <span class="pl-s1">grad</span>
+        <span class="pl-s1">delta</span>.<span class="pl-c1">data</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">clamp</span>(
+            <span class="pl-s1">delta</span> <span class="pl-c1">+</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">alpha</span> <span class="pl-c1">*</span> <span class="pl-s1">torch</span>.<span class="pl-c1">sign</span>(<span class="pl-s1">momentum</span>),
+            <span class="pl-s1">min</span><span class="pl-c1">=</span><span class="pl-c1">-</span><span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">epsilon</span>,
+            <span class="pl-s1">max</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">epsilon</span>,
+        )
+        <span class="pl-c"># [新增点] 强制约束 delta</span>
+        <span class="pl-s1">delta</span>.<span class="pl-c1">data</span> <span class="pl-c1">=</span> <span class="pl-s1">delta</span>.<span class="pl-c1">data</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>
+
+    <span class="pl-c"># Create final adversarial image</span>
+    <span class="pl-c"># [修改点] 最终输出约束</span>
+    <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-s1">image_org</span> <span class="pl-c1">+</span> (<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)
+    <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">clamp</span>(<span class="pl-s1">adv_image</span> <span class="pl-c1">/</span> <span class="pl-c1">255.0</span>, <span class="pl-c1">0.0</span>, <span class="pl-c1">1.0</span>)
+
+    <span class="pl-c"># Log final perturbation metrics</span>
+    <span class="pl-s1">final_metrics</span> <span class="pl-c1">=</span> {
+        <span class="pl-s">"max_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">max</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+        <span class="pl-s">"mean_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">mean</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+    }
+    <span class="pl-en">log_metrics</span>(<span class="pl-s1">pbar</span>, <span class="pl-s1">final_metrics</span>, <span class="pl-s1">img_index</span>)
+
+    <span class="pl-k">return</span> <span class="pl-s1">adv_image</span>
+
+
+<span class="pl-k">def</span> <span class="pl-en">pgd_attack</span>(
+    <span class="pl-s1">cfg</span>: <span class="pl-smi">MainConfig</span>,
+    <span class="pl-s1">ensemble_extractor</span>: <span class="pl-s1">nn</span>.<span class="pl-c1">Module</span>,
+    <span class="pl-s1">ensemble_loss</span>: <span class="pl-s1">nn</span>.<span class="pl-c1">Module</span>,
+    <span class="pl-s1">source_crop</span>: <span class="pl-v">Optional</span>[<span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>],
+    <span class="pl-s1">target_crop</span>: <span class="pl-v">Optional</span>[<span class="pl-s1">transforms</span>.<span class="pl-c1">RandomResizedCrop</span>],
+    <span class="pl-s1">img_index</span>: <span class="pl-smi">int</span>,
+    <span class="pl-s1">image_org</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>,
+    <span class="pl-s1">image_tgt</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>,
+    <span class="pl-s1">mask</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">Tensor</span>  <span class="pl-c"># [新增] 接收 mask</span>
+):
+    <span class="pl-s">"""</span>
+<span class="pl-s">       Perform PGD attack on the image to generate adversarial examples.</span>
+<span class="pl-s"></span>
+<span class="pl-s">       Args:</span>
+<span class="pl-s">           cfg: Configuration parameters</span>
+<span class="pl-s">           ensemble_extractor: Ensemble feature extractor model</span>
+<span class="pl-s">           ensemble_loss: Ensemble loss function</span>
+<span class="pl-s">           source_crop: Optional transform for cropping source images</span>
+<span class="pl-s">           target_crop: Optional transform for cropping target images</span>
+<span class="pl-s">           i: Index of the image (for logging)</span>
+<span class="pl-s">           image_org: Original source image tensor</span>
+<span class="pl-s">           image_tgt: Target image tensor to match features with</span>
+<span class="pl-s"></span>
+<span class="pl-s">       Returns:</span>
+<span class="pl-s">           torch.Tensor: Generated adversarial image</span>
+<span class="pl-s">       """</span>
+    <span class="pl-c"># Initialize perturbation and momentum</span>
+    <span class="pl-s1">delta</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">zeros_like</span>(<span class="pl-s1">image_org</span>, <span class="pl-s1">requires_grad</span><span class="pl-c1">=</span><span class="pl-c1">True</span>)
+    <span class="pl-s1">optimizer</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">Adam</span>([<span class="pl-s1">delta</span>], <span class="pl-s1">lr</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">alpha</span>)
+
+    <span class="pl-c"># Progress bar for optimization</span>
+    <span class="pl-s1">pbar</span> <span class="pl-c1">=</span> <span class="pl-en">tqdm</span>(<span class="pl-en">range</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">steps</span>), <span class="pl-s1">desc</span><span class="pl-c1">=</span><span class="pl-s">f"Attack progress"</span>)
+
+    <span class="pl-c"># Main optimization loop</span>
+    <span class="pl-k">for</span> <span class="pl-s1">epoch</span> <span class="pl-c1">in</span> <span class="pl-s1">pbar</span>:
+
+        <span class="pl-k">with</span> <span class="pl-s1">torch</span>.<span class="pl-c1">no_grad</span>():
+            <span class="pl-s1">ensemble_loss</span>.<span class="pl-c1">set_ground_truth</span>(<span class="pl-en">target_crop</span>(<span class="pl-s1">image_tgt</span>))
+
+        <span class="pl-c"># Forward pass</span>
+        <span class="pl-c"># [修改点] 将矩阵掩码和生成的扰动相乘</span>
+        <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-s1">image_org</span> <span class="pl-c1">+</span> (<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)
+        <span class="pl-s1">adv_features</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_extractor</span>(<span class="pl-s1">adv_image</span>)
+
+        <span class="pl-c"># Calculate metrics</span>
+        <span class="pl-s1">metrics</span> <span class="pl-c1">=</span> {
+            <span class="pl-s">"max_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">max</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+            <span class="pl-s">"mean_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">mean</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+        }
+
+        <span class="pl-c"># Calculate loss based on configuration</span>
+        <span class="pl-s1">global_sim</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_loss</span>(<span class="pl-s1">adv_features</span>)
+        <span class="pl-s1">metrics</span>[<span class="pl-s">"global_similarity"</span>] <span class="pl-c1">=</span> <span class="pl-s1">global_sim</span>.<span class="pl-c1">item</span>()
+
+        <span class="pl-k">if</span> <span class="pl-s1">cfg</span>.<span class="pl-c1">model</span>.<span class="pl-c1">use_source_crop</span>:
+            <span class="pl-c"># If using source crop, calculate additional local similarity</span>
+            <span class="pl-s1">local_cropped</span> <span class="pl-c1">=</span> <span class="pl-en">source_crop</span>(<span class="pl-s1">adv_image</span>)
+            <span class="pl-s1">local_features</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_extractor</span>(<span class="pl-s1">local_cropped</span>)
+            <span class="pl-s1">local_sim</span> <span class="pl-c1">=</span> <span class="pl-en">ensemble_loss</span>(<span class="pl-s1">local_features</span>)
+            <span class="pl-s1">loss</span> <span class="pl-c1">=</span> <span class="pl-c1">-</span><span class="pl-s1">local_sim</span> <span class="pl-c"># since we want to maximize the loss</span>
+            <span class="pl-s1">metrics</span>[<span class="pl-s">"local_similarity"</span>] <span class="pl-c1">=</span> <span class="pl-s1">local_sim</span>.<span class="pl-c1">item</span>()
+        <span class="pl-k">else</span>:
+            <span class="pl-c"># Otherwise use global similarity as loss</span>
+            <span class="pl-s1">loss</span> <span class="pl-c1">=</span> <span class="pl-c1">-</span><span class="pl-s1">global_sim</span>
+
+        <span class="pl-en">log_metrics</span>(<span class="pl-s1">pbar</span>, <span class="pl-s1">metrics</span>, <span class="pl-s1">img_index</span>, <span class="pl-s1">epoch</span>)
+
+        <span class="pl-s1">optimizer</span>.<span class="pl-c1">zero_grad</span>()
+        <span class="pl-s1">loss</span>.<span class="pl-c1">backward</span>()
+
+        <span class="pl-c"># PGD update</span>
+        <span class="pl-s1">optimizer</span>.<span class="pl-c1">step</span>()
+        <span class="pl-s1">delta</span>.<span class="pl-c1">data</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">clamp</span>(
+            <span class="pl-s1">delta</span>,
+            <span class="pl-s1">min</span><span class="pl-c1">=</span><span class="pl-c1">-</span><span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">epsilon</span>,
+            <span class="pl-s1">max</span><span class="pl-c1">=</span><span class="pl-s1">cfg</span>.<span class="pl-c1">optim</span>.<span class="pl-c1">epsilon</span>,
+        )
+        <span class="pl-c"># [新增点] 强制约束 delta</span>
+        <span class="pl-s1">delta</span>.<span class="pl-c1">data</span> <span class="pl-c1">=</span> <span class="pl-s1">delta</span>.<span class="pl-c1">data</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>
+
+    <span class="pl-c"># Create final adversarial image</span>
+    <span class="pl-c"># [修改点] 最终输出约束</span>
+    <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-s1">image_org</span> <span class="pl-c1">+</span> (<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)
+    <span class="pl-s1">adv_image</span> <span class="pl-c1">=</span> <span class="pl-s1">torch</span>.<span class="pl-c1">clamp</span>(<span class="pl-s1">adv_image</span> <span class="pl-c1">/</span> <span class="pl-c1">255.0</span>, <span class="pl-c1">0.0</span>, <span class="pl-c1">1.0</span>)
+
+    <span class="pl-c"># Log final perturbation metrics</span>
+    <span class="pl-s1">final_metrics</span> <span class="pl-c1">=</span> {
+        <span class="pl-s">"max_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">max</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+        <span class="pl-s">"mean_delta"</span>: <span class="pl-s1">torch</span>.<span class="pl-c1">mean</span>(<span class="pl-s1">torch</span>.<span class="pl-c1">abs</span>(<span class="pl-s1">delta</span> <span class="pl-c1">*</span> <span class="pl-s1">mask</span>)).<span class="pl-c1">item</span>(),
+    }
+    <span class="pl-en">log_metrics</span>(<span class="pl-s1">pbar</span>, <span class="pl-s1">final_metrics</span>, <span class="pl-s1">img_index</span>)
+
+    <span class="pl-k">return</span> <span class="pl-s1">adv_image</span>
+
+
+<span class="pl-k">if</span> <span class="pl-s1">__name__</span> <span class="pl-c1">==</span> <span class="pl-s">"__main__"</span>:
+    <span class="pl-en">main</span>()</pre></div>
+<h3>修改镜像并运行</h3>
+<div class="highlight highlight-source-python"><pre class="notranslate"><span class="pl-s1">export</span> <span class="pl-c1">HF_ENDPOINT</span><span class="pl-c1">=</span><span class="pl-s1">https</span>:<span class="pl-c1">//</span><span class="pl-s1">hf</span><span class="pl-c1">-</span><span class="pl-s1">mirror</span>.<span class="pl-c1">com</span>
+<span class="pl-s1">python</span> <span class="pl-s1">adversarial_test</span>.<span class="pl-c1">py</span></pre></div>
+<h3>使用与原文相同的模型进行攻击效果测试</h3>
+<div class="highlight highlight-source-python"><pre class="notranslate"><span class="pl-s1">python</span> <span class="pl-s1">blackbox_text_generation</span>.<span class="pl-c1">py</span> <span class="pl-c1">-</span><span class="pl-s1">m</span> <span class="pl-s1">blackbox</span>.<span class="pl-c1">model_name</span><span class="pl-c1">=</span><span class="pl-s1">gpt4o</span>
+<span class="pl-s1">python</span> <span class="pl-s1">gpt_evaluate</span>.<span class="pl-c1">py</span> <span class="pl-c1">-</span><span class="pl-s1">m</span> <span class="pl-s1">blackbox</span>.<span class="pl-c1">model_name</span><span class="pl-c1">=</span><span class="pl-s1">gpt4o</span>
+<span class="pl-s1">python</span> <span class="pl-s1">keyword_matching_gpt</span>.<span class="pl-c1">py</span> <span class="pl-c1">-</span><span class="pl-s1">m</span> <span class="pl-s1">blackbox</span>.<span class="pl-c1">model_name</span><span class="pl-c1">=</span><span class="pl-s1">gpt4o</span></pre></div></div>
+<div style="font-size:small;margin-top:8px;float:right;"></div>
+
+<button class="btn btn-block" type="button" onclick="openComments()" id="cmButton">评论</button>
+<div class="comments" id="comments"></div>
+
+</div>
+    <div id="footer"><div id="footer1">Copyright © <span id="copyrightYear"></span> <a href="https://KEVINN6.github.io">K's Blog</a></div>
+<div id="footer2">
+    <span id="runday"></span><span>Powered by <a href="https://meekdai.com/Gmeek.html" target="_blank">Gmeek</a></span>
+</div>
+
+<script>
+var now=new Date();
+document.getElementById("copyrightYear").innerHTML=now.getFullYear();
+
+if(""!=""){
+    var startSite=new Date("");
+    var diff=now.getTime()-startSite.getTime();
+    var diffDay=Math.floor(diff/(1000*60*60*24));
+    document.getElementById("runday").innerHTML="网站运行 "+diffDay+" 天"+" • ";
+}
+</script></div>
+</body>
+<script>
+var IconList={'sun': 'M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM8 12a4 4 0 100-8 4 4 0 000 8zM8 0a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0V.75A.75.75 0 018 0zm0 13a.75.75 0 01.75.75v1.5a.75.75 0 01-1.5 0v-1.5A.75.75 0 018 13zM2.343 2.343a.75.75 0 011.061 0l1.06 1.061a.75.75 0 01-1.06 1.06l-1.06-1.06a.75.75 0 010-1.06zm9.193 9.193a.75.75 0 011.06 0l1.061 1.06a.75.75 0 01-1.06 1.061l-1.061-1.06a.75.75 0 010-1.061zM16 8a.75.75 0 01-.75.75h-1.5a.75.75 0 010-1.5h1.5A.75.75 0 0116 8zM3 8a.75.75 0 01-.75.75H.75a.75.75 0 010-1.5h1.5A.75.75 0 013 8zm10.657-5.657a.75.75 0 010 1.061l-1.061 1.06a.75.75 0 11-1.06-1.06l1.06-1.06a.75.75 0 011.06 0zm-9.193 9.193a.75.75 0 010 1.06l-1.06 1.061a.75.75 0 11-1.061-1.06l1.06-1.061a.75.75 0 011.061 0z', 'moon': 'M9.598 1.591a.75.75 0 01.785-.175 7 7 0 11-8.967 8.967.75.75 0 01.961-.96 5.5 5.5 0 007.046-7.046.75.75 0 01.175-.786zm1.616 1.945a7 7 0 01-7.678 7.678 5.5 5.5 0 107.678-7.678z', 'sync': 'M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z', 'home': 'M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z', 'github': 'M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z', 'copy': 'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z', 'check': 'M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'};
+var utterancesLoad=0;
+
+let themeSettings={
+    "dark": ["dark","moon","#00f0ff","dark-blue"],
+    "light": ["light","sun","#ff5000","github-light"],
+    "auto": ["auto","sync","","preferred-color-scheme"]
+};
+function changeTheme(mode, icon, color, utheme){
+    document.documentElement.setAttribute("data-color-mode",mode);
+    document.getElementById("themeSwitch").setAttribute("d",value=IconList[icon]);
+    document.getElementById("themeSwitch").parentNode.style.color=color;
+    if(utterancesLoad==1){utterancesTheme(utheme);}
+}
+function modeSwitch(){
+    let currentMode=document.documentElement.getAttribute('data-color-mode');
+    let newMode = currentMode === "light" ? "dark" : currentMode === "dark" ? "auto" : "light";
+    localStorage.setItem("meek_theme", newMode);
+    if(themeSettings[newMode]){
+        changeTheme(...themeSettings[newMode]);
+    }
+}
+function utterancesTheme(theme){
+    const message={type:'set-theme',theme: theme};
+    const iframe=document.getElementsByClassName('utterances-frame')[0];
+    iframe.contentWindow.postMessage(message,'https://utteranc.es');
+}
+if(themeSettings[theme]){changeTheme(...themeSettings[theme]);}
+console.log("\n %c Gmeek last https://github.com/Meekdai/Gmeek \n","padding:5px 0;background:#02d81d;color:#fff");
+</script>
+
+<script>
+document.getElementById("pathHome").setAttribute("d",IconList["home"]);
+document.getElementById("pathIssue").setAttribute("d",IconList["github"]);
+
+
+
+function openComments(){
+    cm=document.getElementById("comments");
+    cmButton=document.getElementById("cmButton");
+    cmButton.disabled=true;
+    cmButton.innerHTML="loading";
+    span=document.createElement("span");
+    span.setAttribute("class","AnimatedEllipsis");
+    cmButton.appendChild(span);
+
+    script=document.createElement("script");
+    script.setAttribute("src","https://utteranc.es/client.js");
+    script.setAttribute("repo","KEVINN6/KEVINN6.github.io");
+    script.setAttribute("issue-term","title");
+    
+    if(localStorage.getItem("meek_theme")=="dark"){script.setAttribute("theme","dark-blue");}
+    else if(localStorage.getItem("meek_theme")=="light") {script.setAttribute("theme","github-light");}
+    else{script.setAttribute("theme","preferred-color-scheme");}
+    
+    script.setAttribute("crossorigin","anonymous");
+    script.setAttribute("async","");
+    cm.appendChild(script);
+
+    int=self.setInterval("iFrameLoading()",200);
+}
+
+function iFrameLoading(){
+    var utterances=document.getElementsByClassName('utterances');
+    if(utterances.length==1){
+        if(utterances[0].style.height!=""){
+            utterancesLoad=1;
+            int=window.clearInterval(int);
+            document.getElementById("cmButton").style.display="none";
+            console.log("utterances Load OK");
+        }
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const createClipboardHTML = (codeContent, additionalClasses = '') => `
+        <pre class="notranslate"><code class="notranslate">${codeContent}</code></pre>
+        <div class="clipboard-container position-absolute right-0 top-0 ${additionalClasses}">
+            <clipboard-copy class="ClipboardButton btn m-2 p-0" role="button" style="display: inherit;">
+                <svg height="16" width="16" class="octicon octicon-copy m-2"><path d="${IconList["copy"]}"></path></svg>
+                <svg height="16" width="16" class="octicon octicon-check color-fg-success m-2 d-none"><path d="${IconList["check"]}"></path></svg>
+            </clipboard-copy>
+            <div class="copy-feedback">Copied!</div>
+        </div>
+    `;
+
+    const handleCodeElements = (selector = '') => {
+        document.querySelectorAll(selector).forEach(codeElement => {
+            const codeContent = codeElement.innerHTML;
+            const newStructure = document.createElement('div');
+            newStructure.className = 'snippet-clipboard-content position-relative overflow-auto';
+            newStructure.innerHTML = createClipboardHTML(codeContent);
+
+            const parentElement = codeElement.parentElement;
+            if (selector.includes('highlight')) {
+                parentElement.insertBefore(newStructure, codeElement.nextSibling);
+                parentElement.removeChild(codeElement);
+            } else {
+                parentElement.parentElement.replaceChild(newStructure, parentElement);
+            }
+        });
+    };
+
+    handleCodeElements('pre.notranslate > code.notranslate');
+    handleCodeElements('div.highlight > pre.notranslate');
+
+    let currentFeedback = null;
+    document.querySelectorAll('clipboard-copy').forEach(copyButton => {
+        copyButton.addEventListener('click', () => {
+            const codeContent = copyButton.closest('.snippet-clipboard-content').innerText;
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = codeContent;
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempTextArea);
+
+            const copyIcon = copyButton.querySelector('.octicon-copy');
+            const checkIcon = copyButton.querySelector('.octicon-check');
+            const copyFeedback = copyButton.nextElementSibling;
+
+            if (currentFeedback && currentFeedback !== copyFeedback) {currentFeedback.style.display = 'none';}
+            currentFeedback = copyFeedback;
+
+            copyIcon.classList.add('d-none');
+            checkIcon.classList.remove('d-none');
+            copyFeedback.style.display = 'block';
+            copyButton.style.borderColor = 'var(--color-success-fg)';
+
+            setTimeout(() => {
+                copyIcon.classList.remove('d-none');
+                checkIcon.classList.add('d-none');
+                copyFeedback.style.display = 'none';
+                copyButton.style.borderColor = '';
+            }, 2000);
+        });
+    });
+});
+
+</script>
+<script src='https://blog.meekdai.com/Gmeek/plugins/articletoc.js'></script><script src='https://blog.meekdai.com/Gmeek/plugins/lightbox.js'></script>
+
+</html>
