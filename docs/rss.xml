@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>K's Blog</title><link>https://KEVINN6.github.io</link><description>kevinn's Blog</description><copyright>K's Blog</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://avatars.githubusercontent.com/u/135682176?v=4&amp;size=64</url><title>avatar</title><link>https://KEVINN6.github.io</link></image><lastBuildDate>Fri, 08 May 2026 14:40:58 +0000</lastBuildDate><managingEditor>K's Blog</managingEditor><ttl>60</ttl><webMaster>K's Blog</webMaster><item><title>大模型对抗攻击之基于热力图进行针对性的扰动</title><link>https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-ji-yu-re-li-tu-jin-xing-zhen-dui-xing-de-rao-dong.html</link><description># 大模型对抗攻击之基于热力图进行针对性的扰动
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>K's Blog</title><link>https://KEVINN6.github.io</link><description>kevinn's Blog</description><copyright>K's Blog</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://avatars.githubusercontent.com/u/135682176?v=4&amp;size=64</url><title>avatar</title><link>https://KEVINN6.github.io</link></image><lastBuildDate>Sat, 09 May 2026 02:49:13 +0000</lastBuildDate><managingEditor>K's Blog</managingEditor><ttl>60</ttl><webMaster>K's Blog</webMaster><item><title>大模型对抗攻击之基于热力图进行针对性的扰动</title><link>https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-ji-yu-re-li-tu-jin-xing-zhen-dui-xing-de-rao-dong.html</link><description># 大模型对抗攻击之基于热力图进行针对性的扰动
 ## 1 初步修改测试
 &lt;img width='1588' height='485' alt='Image' src='https://github.com/user-attachments/assets/022af6fb-fdfa-4774-9700-a48ef3a781ae' /&gt;
 将扰动与生成的热力图对应的矩阵掩码相乘再与原图进行叠加
@@ -1162,7 +1162,9 @@ def pgd_attack(
 
 if __name__ == '__main__':
     main()
-```。</description><guid isPermaLink="true">https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-ji-yu-re-li-tu-jin-xing-zhen-dui-xing-de-rao-dong.html</guid><pubDate>Fri, 08 May 2026 11:44:16 +0000</pubDate></item><item><title>大模型对抗攻击之热力图的生成</title><link>https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-re-li-tu-de-sheng-cheng.html</link><description># 1.1 初步实现方案
+```
+
+&lt;img width='900' height='847' alt='Image' src='https://github.com/user-attachments/assets/0bdd5c14-8196-4d99-8a5e-2adcaeb3d34d' /&gt;。</description><guid isPermaLink="true">https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-ji-yu-re-li-tu-jin-xing-zhen-dui-xing-de-rao-dong.html</guid><pubDate>Fri, 08 May 2026 11:44:16 +0000</pubDate></item><item><title>大模型对抗攻击之热力图的生成</title><link>https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-re-li-tu-de-sheng-cheng.html</link><description># 1.1 初步实现方案
 ### 1. 热力图是怎么来的？
 在 Vision Transformer (ViT) 架构中，图像被切分成了一个个 Patch（比如 $16 \times 16$ 像素）。</description><guid isPermaLink="true">https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-re-li-tu-de-sheng-cheng.html</guid><pubDate>Mon, 27 Apr 2026 07:49:01 +0000</pubDate></item><item><title>lombok后端导入问题</title><link>https://KEVINN6.github.io/post/lombok-hou-duan-dao-ru-wen-ti.html</link><description>Test
 # lombok在pom导入dependency不生效问题
