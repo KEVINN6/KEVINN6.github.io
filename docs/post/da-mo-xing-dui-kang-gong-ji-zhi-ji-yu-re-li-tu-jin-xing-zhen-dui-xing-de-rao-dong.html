@@ -1402,8 +1402,6 @@ def attack_imgpair(
     )
 
     config_hash = hash_training_config(cfg)
-    # 【修复之前报错】加上时间戳避免覆盖，定义 unique_hash
-    unique_hash = f'{config_hash}_{time.strftime('%m%d_%H%M%S')}'
 
     for path_idx in range(len(path_org)):
         folder, name = (
@@ -1411,7 +1409,7 @@ def attack_imgpair(
             path_org[path_idx].split('/')[-1],
         )
         # 使用 unique_hash
-        folder_to_save = os.path.join(cfg.data.output, 'img', unique_hash, folder)
+        folder_to_save = os.path.join(cfg.data.output, 'img', config_hash, folder)
         ensure_dir(folder_to_save)
 
         if 'JPEG' in name:
@@ -3054,8 +3052,6 @@ def attack_imgpair(
     )
 
     config_hash = hash_training_config(cfg)
-    # 【修复之前报错】加上时间戳避免覆盖，定义 unique_hash
-    unique_hash = f'{config_hash}_{time.strftime('%m%d_%H%M%S')}'
 
     for path_idx in range(len(path_org)):
         folder, name = (
@@ -3063,7 +3059,7 @@ def attack_imgpair(
             path_org[path_idx].split('/')[-1],
         )
         # 使用 unique_hash
-        folder_to_save = os.path.join(cfg.data.output, 'img', unique_hash, folder)
+        folder_to_save = os.path.join(cfg.data.output, 'img', config_hash, folder)
         ensure_dir(folder_to_save)
 
         if 'JPEG' in name:
@@ -4760,8 +4756,6 @@ $adv\_image = image\_org + \delta \times mask$
     )
 
     <span class="pl-s1">config_hash</span> <span class="pl-c1">=</span> <span class="pl-en">hash_training_config</span>(<span class="pl-s1">cfg</span>)
-    <span class="pl-c"># 【修复之前报错】加上时间戳避免覆盖，定义 unique_hash</span>
-    <span class="pl-s1">unique_hash</span> <span class="pl-c1">=</span> <span class="pl-s">f"<span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">config_hash</span><span class="pl-kos">}</span></span>_<span class="pl-s1"><span class="pl-kos">{</span><span class="pl-s1">time</span>.<span class="pl-c1">strftime</span>(<span class="pl-s">'%m%d_%H%M%S'</span>)<span class="pl-kos">}</span></span>"</span>
 
     <span class="pl-k">for</span> <span class="pl-s1">path_idx</span> <span class="pl-c1">in</span> <span class="pl-en">range</span>(<span class="pl-en">len</span>(<span class="pl-s1">path_org</span>)):
         <span class="pl-s1">folder</span>, <span class="pl-s1">name</span> <span class="pl-c1">=</span> (
@@ -4769,7 +4763,7 @@ $adv\_image = image\_org + \delta \times mask$
             <span class="pl-s1">path_org</span>[<span class="pl-s1">path_idx</span>].<span class="pl-c1">split</span>(<span class="pl-s">"/"</span>)[<span class="pl-c1">-</span><span class="pl-c1">1</span>],
         )
         <span class="pl-c"># 使用 unique_hash</span>
-        <span class="pl-s1">folder_to_save</span> <span class="pl-c1">=</span> <span class="pl-s1">os</span>.<span class="pl-c1">path</span>.<span class="pl-c1">join</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">output</span>, <span class="pl-s">"img"</span>, <span class="pl-s1">unique_hash</span>, <span class="pl-s1">folder</span>)
+        <span class="pl-s1">folder_to_save</span> <span class="pl-c1">=</span> <span class="pl-s1">os</span>.<span class="pl-c1">path</span>.<span class="pl-c1">join</span>(<span class="pl-s1">cfg</span>.<span class="pl-c1">data</span>.<span class="pl-c1">output</span>, <span class="pl-s">"img"</span>, <span class="pl-s1">config_hash</span>, <span class="pl-s1">folder</span>)
         <span class="pl-en">ensure_dir</span>(<span class="pl-s1">folder_to_save</span>)
 
         <span class="pl-k">if</span> <span class="pl-s">"JPEG"</span> <span class="pl-c1">in</span> <span class="pl-s1">name</span>:
