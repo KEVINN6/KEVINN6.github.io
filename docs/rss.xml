@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>K's Blog</title><link>https://KEVINN6.github.io</link><description>kevinn's Blog</description><copyright>K's Blog</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://avatars.githubusercontent.com/u/135682176?v=4&amp;size=64</url><title>avatar</title><link>https://KEVINN6.github.io</link></image><lastBuildDate>Sat, 09 May 2026 02:49:13 +0000</lastBuildDate><managingEditor>K's Blog</managingEditor><ttl>60</ttl><webMaster>K's Blog</webMaster><item><title>大模型对抗攻击之基于热力图进行针对性的扰动</title><link>https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-ji-yu-re-li-tu-jin-xing-zhen-dui-xing-de-rao-dong.html</link><description># 大模型对抗攻击之基于热力图进行针对性的扰动
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>K's Blog</title><link>https://KEVINN6.github.io</link><description>kevinn's Blog</description><copyright>K's Blog</copyright><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><image><url>https://avatars.githubusercontent.com/u/135682176?v=4&amp;size=64</url><title>avatar</title><link>https://KEVINN6.github.io</link></image><lastBuildDate>Wed, 03 Jun 2026 05:08:37 +0000</lastBuildDate><managingEditor>K's Blog</managingEditor><ttl>60</ttl><webMaster>K's Blog</webMaster><item><title>大模型对抗攻击之基于热力图进行针对性的扰动</title><link>https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-ji-yu-re-li-tu-jin-xing-zhen-dui-xing-de-rao-dong.html</link><description># 大模型对抗攻击之基于热力图进行针对性的扰动
 ## 1 初步修改测试
 &lt;img width='1588' height='485' alt='Image' src='https://github.com/user-attachments/assets/022af6fb-fdfa-4774-9700-a48ef3a781ae' /&gt;
 将扰动与生成的热力图对应的矩阵掩码相乘再与原图进行叠加
@@ -1164,7 +1164,491 @@ if __name__ == '__main__':
     main()
 ```
 
-&lt;img width='900' height='847' alt='Image' src='https://github.com/user-attachments/assets/0bdd5c14-8196-4d99-8a5e-2adcaeb3d34d' /&gt;。</description><guid isPermaLink="true">https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-ji-yu-re-li-tu-jin-xing-zhen-dui-xing-de-rao-dong.html</guid><pubDate>Fri, 08 May 2026 11:44:16 +0000</pubDate></item><item><title>大模型对抗攻击之热力图的生成</title><link>https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-re-li-tu-de-sheng-cheng.html</link><description># 1.1 初步实现方案
+&lt;img width='900' height='847' alt='Image' src='https://github.com/user-attachments/assets/0bdd5c14-8196-4d99-8a5e-2adcaeb3d34d' /&gt;
+### 2.2 分两次添加扰动
+第一次与原先相同 第二次根据重点区域加扰动
+```python
+import os
+import json
+import hashlib
+import random
+import time  # 确保时间模块被导入用于修复 unique_hash
+import torchvision.transforms as transforms
+import numpy as np
+import torch
+import torchvision
+from PIL import Image, ImageFilter
+import hydra
+from omegaconf import DictConfig
+from config_schema import MainConfig
+from functools import partial
+from typing import List, Dict, Optional
+from torch import nn
+from pytorch_lightning import seed_everything
+import wandb
+from omegaconf import OmegaConf
+from tqdm import tqdm
+
+from rembg import remove
+
+from surrogates import (
+    ClipB16FeatureExtractor,
+    ClipL336FeatureExtractor,
+    ClipB32FeatureExtractor,
+    ClipLaionFeatureExtractor,
+    EnsembleFeatureLoss,
+    EnsembleFeatureExtractor,
+)
+
+from utils import hash_training_config, setup_wandb, ensure_dir
+
+# Mapping from backbone names to model classes
+BACKBONE_MAP: Dict[str, type] = {
+    'L336': ClipL336FeatureExtractor,
+    'B16': ClipB16FeatureExtractor,
+    'B32': ClipB32FeatureExtractor,
+    'Laion': ClipLaionFeatureExtractor,
+}
+
+
+def get_models(cfg: MainConfig):
+    if not cfg.model.ensemble and len(cfg.model.backbone) &gt; 1:
+        raise ValueError('When ensemble=False, only one backbone can be specified')
+
+    models = []
+    for backbone_name in cfg.model.backbone:
+        if backbone_name not in BACKBONE_MAP:
+            raise ValueError(
+                f'Unknown backbone: {backbone_name}. Valid options are: {list(BACKBONE_MAP.keys())}'
+            )
+        model_class = BACKBONE_MAP[backbone_name]
+        model = model_class().eval().to(cfg.model.device).requires_grad_(False)
+        models.append(model)
+
+    if cfg.model.ensemble:
+        ensemble_extractor = EnsembleFeatureExtractor(models)
+    else:
+        ensemble_extractor = models[0]
+
+    return ensemble_extractor, models
+
+
+def get_ensemble_loss(cfg: MainConfig, models: List[nn.Module]):
+    ensemble_loss = EnsembleFeatureLoss(models)
+    return ensemble_loss
+
+
+def set_environment(seed=2023):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def to_tensor(pic):
+    mode_to_nptype = {'I': np.int32, 'I;16': np.int16, 'F': np.float32}
+    img = torch.from_numpy(
+        np.array(pic, mode_to_nptype.get(pic.mode, np.uint8), copy=True)
+    )
+    img = img.view(pic.size[1], pic.size[0], len(pic.getbands()))
+    img = img.permute((2, 0, 1)).contiguous()
+    return img.to(dtype=torch.get_default_dtype())
+
+
+class ImageFolderWithPaths(torchvision.datasets.ImageFolder):
+    def __getitem__(self, index):
+        original_tuple = super().__getitem__(index)
+        path, _ = self.samples[index]
+        return original_tuple + (path,)
+
+
+def generate_batch_masks_on_the_fly(path_list, cfg, device):
+    '''
+    生成标准热力图掩码矩阵 (0.0 ~ 1.0)
+    '''
+    masks = []
+    for p in path_list:
+        raw_image = Image.open(p).convert('RGB')
+        mask_image = remove(raw_image, only_mask=True)
+        blurred_mask = mask_image.filter(ImageFilter.GaussianBlur(radius=10))
+        mask_tensor = transforms.ToTensor()(blurred_mask.convert('L')).to(device)
+        mask_tensor = transforms.Resize((cfg.model.input_res, cfg.model.input_res))(mask_tensor)
+        masks.append(mask_tensor)
+
+    return torch.stack(masks)
+
+
+@hydra.main(version_base=None, config_path='config', config_name='ensemble_3models')
+def main(cfg: MainConfig):
+    set_environment()
+
+    setup_wandb(cfg, tags=['image_generation'])
+    wandb.define_metric('epoch')
+    wandb.define_metric('*', step_metric='epoch')
+
+    ensemble_extractor, models = get_models(cfg)
+    ensemble_loss = get_ensemble_loss(cfg, models)
+
+    transform_fn = transforms.Compose(
+        [
+            transforms.Resize(
+                cfg.model.input_res,
+                interpolation=torchvision.transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.CenterCrop(cfg.model.input_res),
+            transforms.Lambda(lambda img: img.convert('RGB')),
+            transforms.Lambda(lambda img: to_tensor(img)),
+        ]
+    )
+
+    clean_data = ImageFolderWithPaths(cfg.data.cle_data_path, transform=transform_fn)
+    target_data = ImageFolderWithPaths(cfg.data.tgt_data_path, transform=transform_fn)
+
+    data_loader_imagenet = torch.utils.data.DataLoader(
+        clean_data, batch_size=cfg.data.batch_size, shuffle=False
+    )
+    data_loader_target = torch.utils.data.DataLoader(
+        target_data, batch_size=cfg.data.batch_size, shuffle=False
+    )
+
+    print('Using source crop:', cfg.model.use_source_crop)
+    print('Using target crop:', cfg.model.use_target_crop)
+
+    source_crop = (
+        transforms.RandomResizedCrop(cfg.model.input_res, scale=cfg.model.crop_scale)
+        if cfg.model.use_source_crop
+        else torch.nn.Identity()
+    )
+    target_crop = (
+        transforms.RandomResizedCrop(cfg.model.input_res, scale=cfg.model.crop_scale)
+        if cfg.model.use_target_crop
+        else torch.nn.Identity()
+    )
+
+    for i, ((image_org, _, path_org), (image_tgt, _, path_tgt)) in enumerate(
+            zip(data_loader_imagenet, data_loader_target)
+    ):
+        if cfg.data.batch_size * (i + 1) &gt; cfg.data.num_samples:
+            break
+
+        print(f'\nProcessing image {i + 1}/{cfg.data.num_samples // cfg.data.batch_size}')
+
+        # 生成 [0, 1] 标准掩码
+        mask = generate_batch_masks_on_the_fly(path_org, cfg, cfg.model.device)
+
+        attack_imgpair(
+            cfg=cfg,
+            ensemble_extractor=ensemble_extractor,
+            ensemble_loss=ensemble_loss,
+            source_crop=source_crop,
+            img_index=i,
+            image_org=image_org,
+            path_org=path_org,
+            image_tgt=image_tgt,
+            target_crop=target_crop,
+            mask=mask  # 传入标准掩码
+        )
+
+    wandb.finish()
+
+
+def attack_imgpair(
+        cfg: MainConfig,
+        ensemble_extractor: nn.Module,
+        ensemble_loss: nn.Module,
+        source_crop: Optional[transforms.RandomResizedCrop],
+        target_crop: Optional[transforms.RandomResizedCrop],
+        img_index: int,
+        image_org: torch.Tensor,
+        path_org: List[str],
+        image_tgt: torch.Tensor,
+        mask: torch.Tensor
+):
+    image_org, image_tgt = image_org.to(cfg.model.device), image_tgt.to(
+        cfg.model.device
+    )
+    attack_type = cfg.attack
+    attack_fn = {
+        'fgsm': fgsm_attack,
+        'mifgsm': mifgsm_attack,
+        'pgd': pgd_attack,
+    }[attack_type]
+
+    adv_image = attack_fn(
+        cfg=cfg,
+        ensemble_extractor=ensemble_extractor,
+        ensemble_loss=ensemble_loss,
+        source_crop=source_crop,
+        target_crop=target_crop,
+        img_index=img_index,
+        image_org=image_org,
+        image_tgt=image_tgt,
+        mask=mask
+    )
+
+    config_hash = hash_training_config(cfg)
+    # 【修复之前报错】加上时间戳避免覆盖，定义 unique_hash
+    unique_hash = f'{config_hash}_{time.strftime('%m%d_%H%M%S')}'
+
+    for path_idx in range(len(path_org)):
+        folder, name = (
+            path_org[path_idx].split('/')[-2],
+            path_org[path_idx].split('/')[-1],
+        )
+        # 使用 unique_hash
+        folder_to_save = os.path.join(cfg.data.output, 'img', unique_hash, folder)
+        ensure_dir(folder_to_save)
+
+        if 'JPEG' in name:
+            torchvision.utils.save_image(
+                adv_image[path_idx], os.path.join(folder_to_save, name[:-4]) + 'png'
+            )
+        elif 'png' in name:
+            torchvision.utils.save_image(
+                adv_image[path_idx], os.path.join(folder_to_save, name)
+            )
+
+
+def log_metrics(pbar, metrics, img_index, epoch=None):
+    pbar_metrics = {
+        k: f'{v:.5f}' if 'sim' in k else f'{v:.3f}' for k, v in metrics.items()
+    }
+    pbar.set_postfix(pbar_metrics)
+    wandb_metrics = {f'img{img_index}_{k}': v for k, v in metrics.items()}
+    if epoch is not None:
+        wandb_metrics['epoch'] = epoch
+    wandb.log(wandb_metrics)
+
+
+def fgsm_attack(
+        cfg: MainConfig,
+        ensemble_extractor: nn.Module,
+        ensemble_loss: nn.Module,
+        source_crop: Optional[transforms.RandomResizedCrop],
+        target_crop: Optional[transforms.RandomResizedCrop],
+        img_index: int,
+        image_org: torch.Tensor,
+        image_tgt: torch.Tensor,
+        mask: torch.Tensor
+):
+    delta = torch.zeros_like(image_org, requires_grad=True)
+    pbar = tqdm(range(cfg.optim.steps), desc=f'Attack progress')
+
+    for epoch in pbar:
+        with torch.no_grad():
+            ensemble_loss.set_ground_truth(target_crop(image_tgt))
+
+        # ================= 第一阶段：全局扰动 =================
+        adv_image_1 = image_org + delta
+        adv_features_1 = ensemble_extractor(adv_image_1)
+        global_sim_1 = ensemble_loss(adv_features_1)
+
+        if cfg.model.use_source_crop:
+            local_cropped_1 = source_crop(adv_image_1)
+            local_features_1 = ensemble_extractor(local_cropped_1)
+            loss_1 = ensemble_loss(local_features_1)
+        else:
+            loss_1 = global_sim_1
+
+        grad_1 = torch.autograd.grad(loss_1, delta, create_graph=False)[0]
+        # 第一阶段更新：全图无差别更新 delta
+        delta.data = torch.clamp(delta + cfg.optim.alpha * torch.sign(grad_1), min=-cfg.optim.epsilon,
+                                 max=cfg.optim.epsilon)
+
+        # ================= 第二阶段：局部重点扰动 =================
+        adv_image_2 = image_org + delta
+        adv_features_2 = ensemble_extractor(adv_image_2)
+        global_sim_2 = ensemble_loss(adv_features_2)
+
+        if cfg.model.use_source_crop:
+            local_cropped_2 = source_crop(adv_image_2)
+            local_features_2 = ensemble_extractor(local_cropped_2)
+            loss_2 = ensemble_loss(local_features_2)
+            local_sim_val = loss_2.item()
+        else:
+            loss_2 = global_sim_2
+            local_sim_val = None
+
+        grad_2 = torch.autograd.grad(loss_2, delta, create_graph=False)[0]
+
+        # 第二阶段更新：计算出全局梯度后，强制乘以 mask，使得只有高亮区域受到二次加持
+        delta.data = torch.clamp(delta + cfg.optim.alpha * torch.sign(grad_2) * mask, min=-cfg.optim.epsilon,
+                                 max=cfg.optim.epsilon)
+
+        # ================= 记录指标 =================
+        metrics = {
+            'max_delta': torch.max(torch.abs(delta)).item(),
+            'mean_delta': torch.mean(torch.abs(delta)).item(),
+            'global_similarity': global_sim_2.item()
+        }
+        if local_sim_val is not None:
+            metrics['local_similarity'] = local_sim_val
+
+        log_metrics(pbar, metrics, img_index, epoch)
+
+    adv_image = image_org + delta
+    adv_image = torch.clamp(adv_image / 255.0, 0.0, 1.0)
+    return adv_image
+
+
+def mifgsm_attack(
+        cfg: MainConfig,
+        ensemble_extractor: nn.Module,
+        ensemble_loss: nn.Module,
+        source_crop: Optional[transforms.RandomResizedCrop],
+        target_crop: Optional[transforms.RandomResizedCrop],
+        img_index: int,
+        image_org: torch.Tensor,
+        image_tgt: torch.Tensor,
+        mask: torch.Tensor
+):
+    delta = torch.zeros_like(image_org, requires_grad=True)
+    momentum = torch.zeros_like(image_org, requires_grad=False)
+    pbar = tqdm(range(cfg.optim.steps), desc=f'Attack progress')
+
+    for epoch in pbar:
+        with torch.no_grad():
+            ensemble_loss.set_ground_truth(target_crop(image_tgt))
+
+        # ================= 第一阶段：全局扰动 =================
+        adv_image_1 = image_org + delta
+        adv_features_1 = ensemble_extractor(adv_image_1)
+        global_sim_1 = ensemble_loss(adv_features_1)
+
+        if cfg.model.use_source_crop:
+            local_cropped_1 = source_crop(adv_image_1)
+            local_features_1 = ensemble_extractor(local_cropped_1)
+            loss_1 = ensemble_loss(local_features_1)
+        else:
+            loss_1 = global_sim_1
+
+        grad_1 = torch.autograd.grad(loss_1, delta, create_graph=False)[0]
+        momentum = momentum * 0.9 + grad_1
+        # 第一阶段更新：全图应用动量
+        delta.data = torch.clamp(delta + cfg.optim.alpha * torch.sign(momentum), min=-cfg.optim.epsilon,
+                                 max=cfg.optim.epsilon)
+
+        # ================= 第二阶段：局部重点扰动 =================
+        adv_image_2 = image_org + delta
+        adv_features_2 = ensemble_extractor(adv_image_2)
+        global_sim_2 = ensemble_loss(adv_features_2)
+
+        if cfg.model.use_source_crop:
+            local_cropped_2 = source_crop(adv_image_2)
+            local_features_2 = ensemble_extractor(local_cropped_2)
+            loss_2 = ensemble_loss(local_features_2)
+            local_sim_val = loss_2.item()
+        else:
+            loss_2 = global_sim_2
+            local_sim_val = None
+
+        grad_2 = torch.autograd.grad(loss_2, delta, create_graph=False)[0]
+        momentum = momentum * 0.9 + grad_2
+        # 第二阶段更新：动量步长被 mask 严格限制在热力图区域内
+        delta.data = torch.clamp(delta + cfg.optim.alpha * torch.sign(momentum) * mask, min=-cfg.optim.epsilon,
+                                 max=cfg.optim.epsilon)
+
+        # ================= 记录指标 =================
+        metrics = {
+            'max_delta': torch.max(torch.abs(delta)).item(),
+            'mean_delta': torch.mean(torch.abs(delta)).item(),
+            'global_similarity': global_sim_2.item()
+        }
+        if local_sim_val is not None:
+            metrics['local_similarity'] = local_sim_val
+
+        log_metrics(pbar, metrics, img_index, epoch)
+
+    adv_image = image_org + delta
+    adv_image = torch.clamp(adv_image / 255.0, 0.0, 1.0)
+    return adv_image
+
+
+def pgd_attack(
+        cfg: MainConfig,
+        ensemble_extractor: nn.Module,
+        ensemble_loss: nn.Module,
+        source_crop: Optional[transforms.RandomResizedCrop],
+        target_crop: Optional[transforms.RandomResizedCrop],
+        img_index: int,
+        image_org: torch.Tensor,
+        image_tgt: torch.Tensor,
+        mask: torch.Tensor
+):
+    delta = torch.zeros_like(image_org, requires_grad=True)
+    optimizer = torch.optim.Adam([delta], lr=cfg.optim.alpha)
+    pbar = tqdm(range(cfg.optim.steps), desc=f'Attack progress')
+
+    for epoch in pbar:
+        with torch.no_grad():
+            ensemble_loss.set_ground_truth(target_crop(image_tgt))
+
+        # ================= 第一阶段：全局扰动 =================
+        adv_image_1 = image_org + delta
+        adv_features_1 = ensemble_extractor(adv_image_1)
+        global_sim_1 = ensemble_loss(adv_features_1)
+
+        if cfg.model.use_source_crop:
+            local_cropped_1 = source_crop(adv_image_1)
+            local_features_1 = ensemble_extractor(local_cropped_1)
+            loss_1 = -ensemble_loss(local_features_1)  # PGD requires negative loss to maximize similarity
+        else:
+            loss_1 = -global_sim_1
+
+        optimizer.zero_grad()
+        loss_1.backward()
+        # 第一阶段：全局 Adam 步进
+        optimizer.step()
+        delta.data = torch.clamp(delta, min=-cfg.optim.epsilon, max=cfg.optim.epsilon)
+
+        # ================= 第二阶段：局部重点扰动 =================
+        adv_image_2 = image_org + delta
+        adv_features_2 = ensemble_extractor(adv_image_2)
+        global_sim_2 = ensemble_loss(adv_features_2)
+
+        if cfg.model.use_source_crop:
+            local_cropped_2 = source_crop(adv_image_2)
+            local_features_2 = ensemble_extractor(local_cropped_2)
+            loss_2 = -ensemble_loss(local_features_2)
+            local_sim_val = -loss_2.item()
+        else:
+            loss_2 = -global_sim_2
+            local_sim_val = None
+
+        optimizer.zero_grad()
+        loss_2.backward()
+
+        # 核心逻辑：拦截 Adam 的全图更新，只让 mask 区域生效
+        delta_before = delta.data.clone()
+        optimizer.step()
+        delta_update = delta.data - delta_before
+
+        # 第二次更新仅附加在重点区域
+        delta.data = delta_before + (delta_update * mask)
+        delta.data = torch.clamp(delta, min=-cfg.optim.epsilon, max=cfg.optim.epsilon)
+
+        # ================= 记录指标 =================
+        metrics = {
+            'max_delta': torch.max(torch.abs(delta)).item(),
+            'mean_delta': torch.mean(torch.abs(delta)).item(),
+            'global_similarity': global_sim_2.item()
+        }
+        if local_sim_val is not None:
+            metrics['local_similarity'] = local_sim_val
+
+        log_metrics(pbar, metrics, img_index, epoch)
+
+    adv_image = image_org + delta
+    adv_image = torch.clamp(adv_image / 255.0, 0.0, 1.0)
+    return adv_image
+
+
+if __name__ == '__main__':
+    main()
+```。</description><guid isPermaLink="true">https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-ji-yu-re-li-tu-jin-xing-zhen-dui-xing-de-rao-dong.html</guid><pubDate>Fri, 08 May 2026 11:44:16 +0000</pubDate></item><item><title>大模型对抗攻击之热力图的生成</title><link>https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-re-li-tu-de-sheng-cheng.html</link><description># 1.1 初步实现方案
 ### 1. 热力图是怎么来的？
 在 Vision Transformer (ViT) 架构中，图像被切分成了一个个 Patch（比如 $16 \times 16$ 像素）。</description><guid isPermaLink="true">https://KEVINN6.github.io/post/da-mo-xing-dui-kang-gong-ji-zhi-re-li-tu-de-sheng-cheng.html</guid><pubDate>Mon, 27 Apr 2026 07:49:01 +0000</pubDate></item><item><title>lombok后端导入问题</title><link>https://KEVINN6.github.io/post/lombok-hou-duan-dao-ru-wen-ti.html</link><description>Test
 # lombok在pom导入dependency不生效问题
